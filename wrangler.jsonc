@@ -8,7 +8,7 @@
   "browser": { "binding": "BROWSER" },
   "kv_namespaces": [
     // Replace with the ID returned by `wrangler kv namespace create OAUTH_KV`.
-    { "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }
+    { "binding": "OAUTH_KV", "id": "d3e162e0918d482f870e00145e1ac413" }
   ],
   "durable_objects": {
     "bindings": [{ "name": "BROWSER_SESSION", "class_name": "BrowserSession" }]
@@ -17,6 +17,6 @@
     { "tag": "v1", "new_sqlite_classes": ["BrowserSession"] }
   ],
   "vars": {
-    "MCP_BASE_URL": ""
+    "MCP_BASE_URL": "https://browser.ravelloh.com" // replace with your site, or leave it blank to use workers.dev
   }
 }
