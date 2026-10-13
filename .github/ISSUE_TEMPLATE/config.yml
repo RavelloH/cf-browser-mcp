@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability reporting
+    url: https://github.com/RavelloH/cf-browser-mcp/security/advisories/new
+    about: Privately report security vulnerabilities. Do not post them in public issues.

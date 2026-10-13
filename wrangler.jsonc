@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-browser-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-13",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "observability": { "enabled": true },
+  "browser": { "binding": "BROWSER" },
+  "kv_namespaces": [
+    // Replace with the ID returned by `wrangler kv namespace create OAUTH_KV`.
+    { "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "BROWSER_SESSION", "class_name": "BrowserSession" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BrowserSession"] }
+  ],
+  "vars": {
+    "MCP_BASE_URL": ""
+  }
+}

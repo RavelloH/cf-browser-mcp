@@ -1,0 +1,713 @@
+import puppeteer from "@cloudflare/puppeteer";
+import type { Browser, CDPSession, Page } from "@cloudflare/puppeteer";
+import { DurableObject } from "cloudflare:workers";
+import type { Env, SessionRequest, SessionResult } from "./types.js";
+
+const DEFAULT_KEEP_ALIVE_MS = 60_000;
+const MAX_TEXT = 80_000;
+const MAX_CDP_BYTES = 250_000;
+const MAX_SEQUENCE_STEPS = 30;
+const MAX_SEQUENCE_MS = 60_000;
+
+function delay(ms: number) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function keyCode(key: string): string {
+	if (/^[a-z]$/i.test(key)) return `Key${key.toUpperCase()}`;
+	if (/^[0-9]$/.test(key)) return `Digit${key}`;
+	return key;
+}
+
+function virtualKeyCode(key: string): number | undefined {
+	return /^[a-z0-9]$/i.test(key) ? key.toUpperCase().charCodeAt(0) : undefined;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+	let binary = "";
+	for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+		binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+	}
+	return btoa(binary);
+}
+
+function safeHeaders(headers: Record<string, string>) {
+	const hidden = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"]);
+	return Object.fromEntries(Object.entries(headers).map(([name, value]) => [name, hidden.has(name.toLowerCase()) ? "[redacted]" : String(value).slice(0, 1000)]));
+}
+
+type Json = Record<string, any>;
+type AXNode = {
+	nodeId: string;
+	backendDOMNodeId?: number;
+	ignored?: boolean;
+	role?: { value?: string };
+	name?: { value?: string };
+	value?: { value?: string };
+	properties?: Array<{ name: string; value?: { value?: unknown } }>;
+};
+type PersistedBrowserState = {
+	version: 1;
+	cookies: Json[];
+	localStorage: Record<string, Record<string, string>>;
+	tabs: Array<{ url: string; viewport: Json | null }>;
+};
+const MUTATING_OPS = new Set(["new_tab", "close_tab", "navigate", "back", "forward", "reload", "wait", "action", "fill_form", "handle_dialog", "evaluate", "viewport", "mouse", "keyboard", "sequence", "network_requests", "debug_capture", "cdp", "handoff", "handoff_status", "handoff_complete"]);
+
+function jsonResponse(value: unknown, status = 200): Response {
+	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
+}
+
+function safeText(value: unknown, limit = MAX_TEXT): string {
+	const text = typeof value === "string" ? value : JSON.stringify(value);
+	return text.length > limit ? `${text.slice(0, limit)}\n… output truncated (${text.length - limit} more characters)` : text;
+}
+
+async function evaluatePage(page: Page, expression: string, timeoutMs = 10_000): Promise<unknown> {
+	const session = await page.createCDPSession();
+	try {
+		const result = await session.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true, userGesture: true, timeout: Math.min(Math.max(timeoutMs, 1), 30_000) });
+		if (result.exceptionDetails) throw Object.assign(new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page evaluation failed."), { code: "PAGE_EVALUATION_ERROR" });
+		return result.result?.value ?? null;
+	} finally { await session.detach().catch(() => undefined); }
+}
+
+function getTabId(page: Page): string {
+	const target = page.target() as any;
+	return String(target._targetId ?? target._targetInfo?.targetId ?? "unknown");
+}
+
+async function pageSummary(page: Page): Promise<Json> {
+	return {
+		tabId: getTabId(page),
+		url: page.url(),
+		title: await page.title().catch(() => ""),
+		viewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })).catch(() => null),
+	};
+}
+
+async function listTabs(browser: Browser): Promise<Json[]> {
+	const pages = await browser.pages();
+	return Promise.all(pages.map(pageSummary));
+}
+
+async function pickPage(browser: Browser, tabId?: string, create = false): Promise<Page> {
+	const pages = await browser.pages();
+	if (tabId) {
+		const page = pages.find((candidate) => getTabId(candidate) === tabId);
+		if (!page) throw Object.assign(new Error(`Tab ${tabId} does not exist.`), { code: "TAB_NOT_FOUND" });
+		return page;
+	}
+	if (pages[0]) return pages[0];
+	if (!create) throw Object.assign(new Error("No browser tab is open."), { code: "NO_TABS" });
+	return browser.newPage();
+}
+
+function normalizeAX(node: AXNode) {
+	return {
+		role: node.role?.value ?? "",
+		name: node.name?.value ?? "",
+		value: String(node.value?.value ?? ""),
+		backendDOMNodeId: node.backendDOMNodeId ?? null,
+		ignored: Boolean(node.ignored),
+	};
+}
+
+async function axSnapshot(session: CDPSession) {
+	const result = await session.send("Accessibility.getFullAXTree", {}) as { nodes?: AXNode[] };
+	const nodes = (result.nodes ?? []).filter((node) => !node.ignored && node.backendDOMNodeId && node.role?.value !== "none");
+	const serialized = nodes.map(normalizeAX);
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(serialized)));
+	const snapshotId = Array.from(new Uint8Array(digest).slice(0, 9), (byte) => byte.toString(16).padStart(2, "0")).join("");
+	return { nodes, serialized, snapshotId };
+}
+
+async function textSnapshot(page: Page, maxChars = 30_000): Promise<string> {
+	return page.evaluate((max) => {
+		const walk = (root: ParentNode): string[] => {
+			const lines: string[] = [];
+			for (const node of Array.from(root.querySelectorAll("body *"))) {
+				if (node.shadowRoot) lines.push(...walk(node.shadowRoot));
+				const element = node as HTMLElement;
+				if (element.hidden || element.getAttribute("aria-hidden") === "true") continue;
+				const tag = element.tagName.toLowerCase();
+				const role = element.getAttribute("role") || ({ button: "button", a: "link", input: "textbox", textarea: "textbox", select: "combobox" } as Record<string, string>)[tag] || "";
+				const name = element.getAttribute("aria-label") || element.getAttribute("placeholder") || element.innerText?.trim().replace(/\s+/g, " ").slice(0, 180) || "";
+				const attrs = [element.id ? `#${element.id}` : "", element.getAttribute("name") ? `[name=${element.getAttribute("name")}]` : ""].filter(Boolean).join("");
+				if (role || name || attrs) lines.push(`${tag}${attrs}${role ? ` [${role}]` : ""}${name ? ` ${JSON.stringify(name)}` : ""}`);
+			}
+			return lines;
+		};
+		return walk(document).join("\n").slice(0, max);
+	}, maxChars);
+}
+
+async function elementByTarget(page: Page, input: Json, session: CDPSession): Promise<{ objectId: string; backendDOMNodeId: number }> {
+	const locator = input.target ?? input;
+	if (typeof locator.css === "string" && locator.css.length <= 2000) {
+		const { root } = await session.send("DOM.getDocument", { depth: -1, pierce: true });
+		const { nodeId } = await session.send("DOM.querySelector", { nodeId: root.nodeId, selector: locator.css });
+		if (!nodeId) throw Object.assign(new Error(`No element matches selector: ${locator.css}`), { code: "ELEMENT_NOT_FOUND" });
+		const resolved = await session.send("DOM.resolveNode", { nodeId });
+		const backend = await session.send("DOM.describeNode", { nodeId });
+		return { objectId: resolved.object.objectId!, backendDOMNodeId: backend.node.backendNodeId! };
+	}
+
+	if (typeof locator.ref === "string") {
+		const snapshot = await axSnapshot(session);
+		if (!locator.snapshotId || locator.snapshotId !== snapshot.snapshotId) {
+			throw Object.assign(new Error("The element reference is stale. Take a fresh browser_snapshot or browser_find and retry."), { code: "STALE_ELEMENT", snapshotId: snapshot.snapshotId });
+		}
+		const match = /^e(\d+)$/.exec(locator.ref);
+		const node = match ? snapshot.nodes[Number(match[1]) - 1] : undefined;
+		if (!node?.backendDOMNodeId) throw Object.assign(new Error(`Element reference ${locator.ref} was not found in this snapshot.`), { code: "ELEMENT_NOT_FOUND" });
+		const resolved = await session.send("DOM.resolveNode", { backendNodeId: node.backendDOMNodeId });
+		return { objectId: resolved.object.objectId!, backendDOMNodeId: node.backendDOMNodeId };
+	}
+
+	if (typeof locator.role === "string" || typeof locator.name === "string") {
+		const snapshot = await axSnapshot(session);
+		const exact = locator.exact !== false;
+		const name = String(locator.name ?? "");
+		const matches = snapshot.nodes.map((node, index) => ({ node, index })).filter(({ node }) => {
+			const roleOkay = !locator.role || node.role?.value === locator.role;
+			const candidate = node.name?.value ?? "";
+			const nameOkay = !name || (exact ? candidate === name : candidate.toLocaleLowerCase().includes(name.toLocaleLowerCase()));
+			return roleOkay && nameOkay;
+		});
+		if (matches.length > 1) throw Object.assign(new Error(`The locator matched ${matches.length} elements; narrow it with a fresh ref or CSS selector.`), { code: "AMBIGUOUS_TARGET", matches: matches.slice(0, 20).map(({ node, index }) => ({ ref: `e${index + 1}`, role: node.role?.value, name: node.name?.value, snapshotId: snapshot.snapshotId })) });
+		const node = matches[0]?.node;
+		if (!node?.backendDOMNodeId) throw Object.assign(new Error("No element matched the requested role and name."), { code: "ELEMENT_NOT_FOUND" });
+		const resolved = await session.send("DOM.resolveNode", { backendNodeId: node.backendDOMNodeId });
+		return { objectId: resolved.object.objectId!, backendDOMNodeId: node.backendDOMNodeId };
+	}
+	throw Object.assign(new Error("Pass a target with css, ref + snapshotId, or role/name."), { code: "INVALID_TARGET" });
+}
+
+async function callElement(session: CDPSession, objectId: string, functionDeclaration: string, args: unknown[] = []) {
+	const result = await session.send("Runtime.callFunctionOn", {
+		objectId,
+		functionDeclaration,
+		arguments: args.map((value) => ({ value })),
+		awaitPromise: true,
+		returnByValue: true,
+		userGesture: true,
+	});
+	if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? "Page script failed.");
+	return result.result?.value;
+}
+
+async function elementCenter(session: CDPSession, backendDOMNodeId: number) {
+	await session.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: backendDOMNodeId });
+	const { model } = await session.send("DOM.getBoxModel", { backendNodeId: backendDOMNodeId });
+	const points = model.content as number[];
+	return { x: (points[0] + points[2] + points[4] + points[6]) / 4, y: (points[1] + points[3] + points[5] + points[7]) / 4 };
+}
+
+async function snapshot(page: Page, input: Json) {
+	const session = await page.createCDPSession();
+	try {
+		const ax = await axSnapshot(session);
+		const maxNodes = Math.min(Math.max(Number(input.maxNodes ?? 250), 1), 1000);
+		const maxChars = Math.min(Math.max(Number(input.maxChars ?? 30_000), 500), MAX_TEXT);
+		const nodes = ax.nodes.slice(0, maxNodes).map((node, index) => ({
+			ref: `e${index + 1}`,
+			role: node.role?.value ?? "",
+			name: node.name?.value ?? "",
+			value: node.value?.value,
+			backendDOMNodeId: undefined,
+		}));
+		return { tabId: getTabId(page), url: page.url(), title: await page.title(), snapshotId: ax.snapshotId, nodes, text: safeText(await textSnapshot(page, maxChars), maxChars), truncated: ax.nodes.length > maxNodes };
+	} finally {
+		await session.detach().catch(() => undefined);
+	}
+}
+
+async function browserStatus(env: Env, sessionId: string | undefined) {
+	if (!sessionId) return { active: false, browserSessionId: null, tabs: [] };
+	try {
+		const sessions = await puppeteer.sessions(env.BROWSER as any);
+		return { active: sessions.some((session) => session.sessionId === sessionId), browserSessionId: undefined, tabs: [] };
+	} catch {
+		return { active: null, browserSessionId: undefined, tabs: [], error: "Could not query Browser Run session metadata." };
+	}
+}
+
+export class BrowserSession extends DurableObject<Env> {
+	private lock: Promise<void> = Promise.resolve();
+
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env);
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { allow: "POST" } });
+		const startedAt = Date.now();
+		const previous = this.lock;
+		let release!: () => void;
+		this.lock = new Promise<void>((resolve) => { release = resolve; });
+		await previous;
+		try {
+			const input = await request.json() as SessionRequest;
+			const result = await this.dispatch(input);
+			result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+			return jsonResponse(result);
+		} catch (error) {
+			const value = error as { code?: string; message?: string; [key: string]: unknown };
+			return jsonResponse({ isError: true, code: value.code ?? "BROWSER_ERROR", message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.snapshotId ? { snapshotId: value.snapshotId } : {}), ...(value.matches ? { matches: value.matches } : {}), ...(value.persistenceWarning ? { persistenceWarning: value.persistenceWarning } : {}) });
+		} finally {
+			release();
+		}
+	}
+
+	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
+
+	private async restoreState(browser: Browser): Promise<void> {
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state || state.version !== 1) return;
+		const pages = await browser.pages();
+		const anchor = pages[0] ?? await browser.newPage();
+		if (state.cookies.length) {
+			const session = await anchor.createCDPSession();
+			try { await session.send("Network.setCookies", { cookies: state.cookies as any }); }
+			finally { await session.detach().catch(() => undefined); }
+		}
+		const urls = state.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).slice(0, 30);
+		const restoreTargets: Array<{ page: Page; url: string }> = [];
+		for (const [index, tabState] of urls.entries()) {
+			const page = index === 0 ? anchor : await browser.newPage();
+			if (tabState.viewport) await page.setViewport({ width: Number(tabState.viewport.width ?? 1280), height: Number(tabState.viewport.height ?? 720), deviceScaleFactor: Number(tabState.viewport.deviceScaleFactor ?? 1) });
+			await page.evaluateOnNewDocument((origins: Record<string, Record<string, string>>) => {
+				const values = origins[location.origin];
+				if (!values) return;
+				try { for (const [key, value] of Object.entries(values)) localStorage.setItem(key, value); } catch { /* The page may disable storage. */ }
+			}, state.localStorage);
+			restoreTargets.push({ page, url: tabState.url });
+		}
+		for (let offset = 0; offset < restoreTargets.length; offset += 5) {
+			await Promise.all(restoreTargets.slice(offset, offset + 5).map(async ({ page, url }) => {
+				try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 }); } catch { /* Keep the tab even when the site is temporarily unavailable. */ }
+			}));
+		}
+	}
+
+	private async persistState(browser: Browser): Promise<void> {
+		const pages = await browser.pages();
+		const anchor = pages[0] ?? await browser.newPage();
+		const cookieSession = await anchor.createCDPSession();
+		let cookies: Json[] = [];
+		try {
+			const result = await (cookieSession as any).send("Network.getAllCookies") as { cookies?: Json[] };
+			cookies = (result.cookies ?? []).slice(0, 3000).map((cookie) => {
+				const { session, ...cookieParam } = cookie;
+				if (session || Number(cookieParam.expires) < 0) delete cookieParam.expires;
+				return cookieParam;
+			});
+		} finally { await cookieSession.detach().catch(() => undefined); }
+		const localStorage: Record<string, Record<string, string>> = {};
+		const tabs: PersistedBrowserState["tabs"] = [];
+		for (const page of pages.slice(0, 30)) {
+			const url = page.url();
+			if (/^https?:\/\//i.test(url)) tabs.push({ url, viewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })).catch(() => null) });
+			const values = await page.evaluate(() => {
+				const result: Record<string, string> = {};
+				try { for (let i = 0; i < Math.min(window.localStorage.length, 500); i++) { const key = window.localStorage.key(i); if (key) result[key] = String(window.localStorage.getItem(key) ?? "").slice(0, 10_000); } } catch { /* The page may disable storage. */ }
+				return result;
+			}).catch(() => null);
+			if (values && /^https?:\/\//i.test(url)) localStorage[new URL(url).origin] = values;
+		}
+		let state: PersistedBrowserState = { version: 1, cookies, localStorage, tabs };
+		let serialized = JSON.stringify(state);
+		if (new TextEncoder().encode(serialized).byteLength > 1_500_000) {
+			state = { ...state, localStorage: {}, tabs: state.tabs.slice(0, 15) };
+			serialized = JSON.stringify(state);
+		}
+		if (new TextEncoder().encode(serialized).byteLength > 1_800_000) throw Object.assign(new Error("Browser state exceeds the 1.8 MB durable persistence limit; close tabs or clear oversized site data before continuing."), { code: "STATE_TOO_LARGE" });
+		const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(serialized)));
+		const hash = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+		const saved = await this.ctx.storage.get<{ hash: string }>("browserStateRecord");
+		if (saved?.hash === hash) return;
+		await this.ctx.storage.put("browserStateRecord", { state, hash });
+	}
+
+	private async connectBrowser(allowLaunch: boolean): Promise<{ browser?: Browser; sessionId?: string; created: boolean }> {
+		let sessionId = await this.storedSessionId();
+		if (sessionId) {
+			try { return { browser: await puppeteer.connect(this.env.BROWSER as any, sessionId), sessionId, created: false }; }
+			catch {
+				await this.ctx.storage.delete("browserSessionId");
+				sessionId = undefined;
+			}
+		}
+		if (!allowLaunch) return { created: false };
+		const browser = await puppeteer.launch(this.env.BROWSER as any, { keep_alive: DEFAULT_KEEP_ALIVE_MS });
+		sessionId = browser.sessionId();
+		try {
+			await this.ctx.storage.put("browserSessionId", sessionId);
+			await this.restoreState(browser);
+		} catch (error) {
+			try { await browser.close(); } catch { browser.disconnect(); }
+			await this.ctx.storage.delete("browserSessionId");
+			throw Object.assign(new Error(`Could not restore the saved browser state: ${(error as Error).message}`), { code: "RESTORE_FAILED" });
+		}
+		return { browser, sessionId, created: true };
+	}
+
+	private async dispatch(request: SessionRequest): Promise<SessionResult> {
+		const { op, input = {} } = request;
+		if (op === "status") {
+			const sessionId = await this.storedSessionId();
+			const status = await browserStatus(this.env, sessionId);
+			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+			return { structuredContent: { ...status, restorableTabs: saved?.tabs.map((tab) => ({ url: tab.url })) ?? [] } };
+		}
+		if (op === "close_session") {
+			const sessionId = await this.storedSessionId();
+			if (sessionId) {
+				let browser: Browser | undefined;
+				try { browser = await puppeteer.connect(this.env.BROWSER as any, sessionId); }
+				catch { /* Already expired or closed. */ }
+				if (browser) {
+					try { await this.persistState(browser); }
+					catch (error) { browser.disconnect(); throw Object.assign(new Error(`Browser state could not be saved; the remote session was left open: ${(error as Error).message}`), { code: "STATE_PERSIST_FAILED" }); }
+					await browser.close();
+				}
+				await this.ctx.storage.delete("browserSessionId");
+			}
+			return { structuredContent: { closed: Boolean(sessionId) } };
+		}
+		if (op === "clear_saved_state") {
+			const sessionId = await this.storedSessionId();
+			if (sessionId) {
+				try { const browser = await puppeteer.connect(this.env.BROWSER as any, sessionId); await browser.close(); }
+				catch { /* Already expired or closed. */ }
+			}
+			await this.ctx.storage.delete(["browserSessionId", "browserStateRecord"]);
+			return { structuredContent: { cleared: true, browserClosed: Boolean(sessionId) } };
+		}
+
+		const readOnlyOps = new Set(["list_tabs", "activate_tab", "page_info", "handoff_status"]);
+		const allowLaunch = !readOnlyOps.has(op);
+		const connection = await this.connectBrowser(allowLaunch);
+		if (!connection.browser) {
+			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+			return { structuredContent: { active: false, tabs: [], restorableTabs: saved?.tabs.map((tab) => ({ url: tab.url })) ?? [] }, content: [{ type: "text", text: saved?.tabs.length ? "Browser is idle; saved cookies and site storage will be restored when the next browser operation starts." : "Browser session has not started. Call browser_navigate or browser_new_tab to start one." }] };
+		}
+		const browser = connection.browser;
+		if (op === "resume") {
+			try { return { structuredContent: { active: true, restored: connection.created, tabs: await listTabs(browser) } }; }
+			finally { browser.disconnect(); }
+		}
+		let result: SessionResult | undefined;
+		let operationError: unknown;
+		try {
+			result = await this.runOperation(browser, op, input);
+		} catch (error) {
+			operationError = error;
+		} finally {
+			if (MUTATING_OPS.has(op)) {
+				try { await this.persistState(browser); }
+				catch (error) {
+					if (!operationError && result) result.structuredContent = { ...(result.structuredContent ?? {}), persistenceWarning: (error as Error).message };
+					else if (operationError && typeof operationError === "object") (operationError as Json).persistenceWarning = (error as Error).message;
+				}
+			}
+			browser.disconnect();
+		}
+		if (operationError) throw operationError;
+		return result!;
+	}
+
+	private async runOperation(browser: Browser, op: string, input: Json): Promise<SessionResult> {
+		if (op === "list_tabs") return { structuredContent: { tabs: await listTabs(browser) } };
+		if (op === "activate_tab") {
+			const page = await pickPage(browser, String(input.tabId ?? ""));
+			await page.bringToFront();
+			return { structuredContent: { active: true, page: await pageSummary(page) } };
+		}
+		if (op === "new_tab") {
+			const page = await browser.newPage();
+			if (typeof input.url === "string" && input.url) await page.goto(input.url, { waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
+			return { structuredContent: { tab: await pageSummary(page), tabs: await listTabs(browser) } };
+		}
+		if (op === "close_tab") {
+			const page = await pickPage(browser, String(input.tabId ?? ""));
+			const tabId = getTabId(page);
+			await page.close();
+			return { structuredContent: { closed: true, tabId, tabs: await listTabs(browser) } };
+		}
+		const page = await pickPage(browser, input.tabId ? String(input.tabId) : undefined, true);
+		if (op === "page_info") return { structuredContent: await pageSummary(page) };
+		if (op === "navigate") {
+			const response = await page.goto(String(input.url), { waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
+			return { structuredContent: { page: await pageSummary(page), status: response?.status() ?? null, responseUrl: response?.url() ?? null } };
+		}
+		if (op === "back" || op === "forward") {
+			const response = op === "back" ? await page.goBack({ waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) }) : await page.goForward({ waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
+			return { structuredContent: { page: await pageSummary(page), status: response?.status() ?? null } };
+		}
+		if (op === "reload") {
+			const response = await page.reload({ waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
+			return { structuredContent: { page: await pageSummary(page), status: response?.status() ?? null } };
+		}
+		if (op === "wait") {
+			if (input.selector) await page.waitForSelector(String(input.selector), { timeout: Number(input.timeoutMs ?? 10_000), visible: input.visible !== false });
+			else if (input.text) await page.waitForFunction((needle) => document.body?.innerText.includes(needle), { timeout: Number(input.timeoutMs ?? 10_000) }, String(input.text));
+			else await new Promise((resolve) => setTimeout(resolve, Math.min(Number(input.timeoutMs ?? 1000), 30_000)));
+			return { structuredContent: { page: await pageSummary(page) } };
+		}
+		if (op === "snapshot") return { structuredContent: await snapshot(page, input) };
+		if (op === "find") {
+			const result = await snapshot(page, { maxNodes: 1000, maxChars: 500 });
+			const nodes = (result.nodes as Json[]).filter((node) => {
+				const roleMatch = !input.role || node.role === input.role;
+				const query = String(input.query ?? input.name ?? "").toLocaleLowerCase();
+				const name = String(node.name ?? "").toLocaleLowerCase();
+				return roleMatch && (!query || (input.exact ? name === query : name.includes(query)));
+			}).slice(0, Math.min(Number(input.limit ?? 50), 100));
+			return { structuredContent: { tabId: result.tabId, url: result.url, snapshotId: result.snapshotId, matches: nodes } };
+		}
+		if (op === "screenshot") {
+			const options: Json = { type: input.type === "jpeg" ? "jpeg" : "png", fullPage: Boolean(input.fullPage) };
+			if (input.quality != null) options.quality = Math.min(Math.max(Number(input.quality), 1), 100);
+			if (input.clip && typeof input.clip === "object") options.clip = input.clip;
+			const shot = await page.screenshot(options) as unknown as Uint8Array;
+			if (shot.byteLength > 5_000_000) throw Object.assign(new Error("Screenshot exceeds the 5 MB MCP image limit. Use a smaller viewport, a clip rectangle, or JPEG."), { code: "OUTPUT_TOO_LARGE" });
+			const data = bytesToBase64(shot);
+			const mimeType = options.type === "jpeg" ? "image/jpeg" : "image/png";
+			return { content: [{ type: "text", text: JSON.stringify({ tabId: getTabId(page), url: page.url(), mimeType }) }, { type: "image", data, mimeType }], structuredContent: { tabId: getTabId(page), url: page.url(), mimeType } };
+		}
+		if (op === "evaluate") {
+			const value = await evaluatePage(page, String(input.expression), Number(input.timeoutMs ?? 10_000));
+			const serialized = JSON.stringify(value ?? null);
+			const truncated = serialized.length > MAX_TEXT;
+			const bounded = truncated ? serialized.slice(0, MAX_TEXT) : value ?? null;
+			return { structuredContent: { result: bounded, truncated, page: await pageSummary(page) }, content: [{ type: "text", text: safeText(value ?? null) }] };
+		}
+		if (op === "viewport") {
+			const session = await page.createCDPSession();
+			try {
+				await session.send("Emulation.setDeviceMetricsOverride", { width: Number(input.width), height: Number(input.height), deviceScaleFactor: Number(input.deviceScaleFactor ?? 1), mobile: Boolean(input.mobile) });
+				return { structuredContent: { page: await pageSummary(page) } };
+			} finally { await session.detach().catch(() => undefined); }
+		}
+		if (op === "mouse") {
+			const session = await page.createCDPSession();
+			try {
+				const action = String(input.action ?? "move");
+				const dimensions = await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1280, height: 720 }));
+				const x = Number(input.x ?? Math.floor(dimensions.width / 2)), y = Number(input.y ?? Math.floor(dimensions.height / 2));
+				if (![x, y].every(Number.isFinite)) throw Object.assign(new Error("Mouse coordinates must be finite numbers."), { code: "INVALID_INPUT" });
+				if (action === "click") {
+					await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+					await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+					await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+				} else if (action === "move") await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+				else if (action === "down" || action === "up") await session.send("Input.dispatchMouseEvent", { type: action === "down" ? "mousePressed" : "mouseReleased", x, y, button: input.button ?? "left" });
+				else if (action === "wheel") await session.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: Number(input.deltaX ?? 0), deltaY: Number(input.deltaY ?? 0) });
+				else if (action === "drag") {
+					const endX = Number(input.endX), endY = Number(input.endY);
+					if (![endX, endY].every(Number.isFinite)) throw Object.assign(new Error("Drag needs finite endX and endY."), { code: "INVALID_INPUT" });
+					await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+					await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1 });
+					for (let step = 1; step <= 6; step++) await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x + (endX - x) * step / 6, y: y + (endY - y) * step / 6, button: "left", buttons: 1 });
+					await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left" });
+				} else throw Object.assign(new Error(`Unknown mouse action: ${action}`), { code: "INVALID_ACTION" });
+				return { structuredContent: { action, x, y, page: await pageSummary(page) } };
+			} finally { await session.detach().catch(() => undefined); }
+		}
+		if (op === "keyboard") {
+			const session = await page.createCDPSession();
+			try {
+				const action = String(input.action ?? "press");
+				if (action === "type") await session.send("Input.insertText", { text: String(input.text ?? "") });
+				else {
+					const key = String(input.key ?? "Enter");
+					const modifierMap: Record<string, number> = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Shift: 8 };
+					const modifiers = (Array.isArray(input.modifiers) ? input.modifiers : []).reduce((bits: number, name: unknown) => bits | (modifierMap[String(name)] ?? 0), 0);
+					if (!["press", "down", "up"].includes(action)) throw Object.assign(new Error(`Unknown keyboard action: ${action}`), { code: "INVALID_ACTION" });
+					const eventType = action === "down" ? "keyDown" : action === "up" ? "keyUp" : "keyDown";
+					const code = String(input.code ?? keyCode(key));
+					const vkey = virtualKeyCode(key);
+					await session.send("Input.dispatchKeyEvent", { type: eventType, key, code, modifiers, ...(input.text ? { text: String(input.text) } : {}), ...(vkey !== undefined ? { windowsVirtualKeyCode: vkey } : {}) });
+					if (action === "press") await session.send("Input.dispatchKeyEvent", { type: "keyUp", key, code, modifiers, ...(vkey !== undefined ? { windowsVirtualKeyCode: vkey } : {}) });
+				}
+				return { structuredContent: { action, page: await pageSummary(page) } };
+			} finally { await session.detach().catch(() => undefined); }
+		}
+		if (op === "handle_dialog") {
+			const session = await page.createCDPSession();
+			try { await session.send("Page.handleJavaScriptDialog", { accept: Boolean(input.accept), ...(input.promptText ? { promptText: String(input.promptText) } : {}) }); return { structuredContent: { handled: true, page: await pageSummary(page) } }; }
+			finally { await session.detach().catch(() => undefined); }
+		}
+		if (op === "action") return this.performAction(page, input);
+		if (op === "fill_form") return this.fillForm(page, input);
+		if (op === "cdp") {
+			const method = String(input.method ?? "");
+			if (!/^[A-Z][A-Za-z0-9]+\.[A-Za-z][A-Za-z0-9]+$/.test(method)) throw Object.assign(new Error("CDP method must use Domain.command syntax."), { code: "INVALID_CDP_METHOD" });
+			const session = input.scope === "browser" ? await browser.target().createCDPSession() : await page.createCDPSession();
+			try {
+				const result = await (session as any).send(method, (input.params ?? {}) as any);
+				const serialized = JSON.stringify(result ?? null);
+				const truncated = new TextEncoder().encode(serialized).byteLength > MAX_CDP_BYTES;
+				const text = truncated ? `${serialized.slice(0, MAX_CDP_BYTES)}\n… CDP output truncated` : serialized;
+				return { structuredContent: truncated ? { resultPreview: serialized.slice(0, MAX_CDP_BYTES), truncated: true, scope: input.scope === "browser" ? "browser" : "page", tabId: getTabId(page) } : { result: result ?? null, scope: input.scope === "browser" ? "browser" : "page", tabId: getTabId(page) }, content: [{ type: "text", text }] };
+			} finally { await session.detach().catch(() => undefined); }
+		}
+		if (op === "network_requests" || op === "debug_capture") return this.captureDuringAction(page, input, op === "debug_capture");
+		if (op === "sequence") return this.sequence(browser, page, input);
+		if (op === "live_view" || op === "handoff" || op === "handoff_status" || op === "handoff_complete") return this.handoff(browser, page, op, input);
+		throw Object.assign(new Error(`Unknown browser operation: ${op}`), { code: "UNKNOWN_OPERATION" });
+	}
+
+	private async performAction(page: Page, input: Json): Promise<SessionResult> {
+		const action = String(input.action ?? "");
+		const session = await page.createCDPSession();
+		try {
+			const target = await elementByTarget(page, input, session);
+			let result: unknown;
+			if (action === "click" || action === "hover") {
+				const center = await elementCenter(session, target.backendDOMNodeId);
+				if (action === "click") {
+					await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
+					await session.send("Input.dispatchMouseEvent", { type: "mousePressed", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+					await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+				} else await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
+			} else if (action === "fill") {
+				result = await callElement(session, target.objectId, `function(value){const e=this;const proto=e instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:e instanceof HTMLInputElement?HTMLInputElement.prototype:null;const setter=proto&&Object.getOwnPropertyDescriptor(proto,'value')?.set;if(setter)setter.call(e,value);else if(e.isContentEditable)e.textContent=value;else throw new Error('Target is not an editable field');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {tag:e.tagName,value:e.value??e.textContent};}`, [String(input.value ?? "")]);
+			} else if (action === "type") {
+				await callElement(session, target.objectId, "function(){this.focus();}");
+				await session.send("Input.insertText", { text: String(input.text ?? "") });
+			} else if (action === "press_key") {
+				await callElement(session, target.objectId, "function(){this.focus();}");
+				const key = String(input.key ?? "Enter");
+				await session.send("Input.dispatchKeyEvent", { type: "keyDown", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
+				if (key.length === 1) await session.send("Input.dispatchKeyEvent", { type: "char", text: key, key });
+				await session.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
+			} else if (action === "select_option") {
+				result = await callElement(session, target.objectId, `function(value){if(!(this instanceof HTMLSelectElement))throw new Error('Target is not a select');const values=Array.isArray(value)?value.map(String):[String(value)];for(const option of this.options)option.selected=values.includes(option.value);this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return {value:this.value,selected:[...this.selectedOptions].map(o=>({value:o.value,text:o.text}))};}`, [input.value]);
+			} else if (action === "check" || action === "uncheck") {
+				result = await callElement(session, target.objectId, `function(checked){if(!(this instanceof HTMLInputElement)||!['checkbox','radio'].includes(this.type))throw new Error('Target is not a checkbox or radio');this.checked=checked;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return {checked:this.checked};}`, [action === "check"]);
+			} else if (action === "focus") await callElement(session, target.objectId, "function(){this.focus();}");
+			else if (action === "scroll_into_view") await session.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: target.backendDOMNodeId });
+			else throw Object.assign(new Error(`Unsupported action: ${action}`), { code: "INVALID_ACTION" });
+			await delay(Number(input.afterMs ?? 100));
+			return { structuredContent: { action, result, page: await pageSummary(page), snapshot: input.includeSnapshot ? await snapshot(page, {}) : undefined } };
+		} finally { await session.detach().catch(() => undefined); }
+	}
+
+	private async fillForm(page: Page, input: Json): Promise<SessionResult> {
+		if (!Array.isArray(input.fields) || input.fields.length > 100) throw Object.assign(new Error("fields must contain at most 100 field definitions."), { code: "INVALID_INPUT" });
+		const session = await page.createCDPSession();
+		try {
+			const resolved = [];
+			for (const field of input.fields) resolved.push({ field, target: await elementByTarget(page, field, session) });
+			const results = [];
+			for (const { field, target } of resolved) {
+				const op = field.action === "select_option" ? "select_option" : field.action === "check" ? "check" : field.action === "uncheck" ? "uncheck" : "fill";
+				let result: unknown;
+				if (op === "select_option") result = await callElement(session, target.objectId, `function(value){if(!(this instanceof HTMLSelectElement))throw new Error('Target is not a select');const values=Array.isArray(value)?value.map(String):[String(value)];for(const option of this.options)option.selected=values.includes(option.value);this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return this.value;}`, [field.value]);
+				else if (op === "check" || op === "uncheck") result = await callElement(session, target.objectId, "function(value){if(!(this instanceof HTMLInputElement))throw new Error('Target is not an input');this.checked=value;this.dispatchEvent(new Event('change',{bubbles:true}));return this.checked;}", [op === "check"]);
+				else result = await callElement(session, target.objectId, `function(value){const p=this instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:this instanceof HTMLInputElement?HTMLInputElement.prototype:null;const s=p&&Object.getOwnPropertyDescriptor(p,'value')?.set;if(s)s.call(this,value);else if(this.isContentEditable)this.textContent=value;else throw new Error('Target is not editable');this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}));return this.value??this.textContent;}`, [String(field.value ?? "")]);
+				results.push({ result });
+			}
+			return { structuredContent: { count: results.length, results, page: await pageSummary(page) } };
+		} finally { await session.detach().catch(() => undefined); }
+	}
+
+	private async captureDuringAction(page: Page, input: Json, debug: boolean): Promise<SessionResult> {
+		const requests: Json[] = [];
+		const consoles: Json[] = [];
+		const errors: Json[] = [];
+		const requestsByUrl = new Map<any, Json>();
+		const onRequest = (request: any) => {
+			if (requests.length >= 500) return;
+			const item = { url: request.url(), method: request.method(), resourceType: request.resourceType(), requestHeaders: safeHeaders(request.headers()) };
+			requests.push(item);
+			requestsByUrl.set(request, item);
+		};
+		const onResponse = (response: any) => { const item = requestsByUrl.get(response.request()); if (item) Object.assign(item, { status: response.status(), responseHeaders: safeHeaders(response.headers()), fromCache: response.fromCache() }); };
+		const onRequestFailed = (request: any) => { const item = requestsByUrl.get(request); if (item) item.failure = request.failure()?.errorText ?? "Request failed"; };
+		const onConsole = (message: any) => consoles.push({ type: message.type(), text: message.text().slice(0, 4000), location: message.location() });
+		const onPageError = (error: Error) => errors.push({ message: error.message.slice(0, 4000) });
+		page.on("request", onRequest); page.on("response", onResponse); page.on("requestfailed", onRequestFailed);
+		if (debug) { page.on("console", onConsole); page.on("pageerror", onPageError); }
+		try {
+			const action = input.action as Json | undefined;
+			if (!action) throw Object.assign(new Error("Provide one bounded action to capture, such as {type:'navigate', url} or {type:'reload'}."), { code: "INVALID_INPUT" });
+			if (action.type === "navigate") await page.goto(String(action.url), { waitUntil: action.waitUntil ?? "domcontentloaded", timeout: Number(action.timeoutMs ?? 30_000) });
+			else if (action.type === "reload") await page.reload({ waitUntil: action.waitUntil ?? "domcontentloaded", timeout: Number(action.timeoutMs ?? 30_000) });
+			else if (action.type === "click") await this.performAction(page, { ...action, action: "click" });
+			else if (action.type === "evaluate") await evaluatePage(page, String(action.expression), Number(action.timeoutMs ?? 10_000));
+			else throw Object.assign(new Error("Capture supports navigate, reload, click, or evaluate actions."), { code: "INVALID_ACTION" });
+			await delay(Math.min(Number(input.settleMs ?? 250), 5000));
+			return { structuredContent: { page: await pageSummary(page), requests: requests.slice(0, 500), ...(debug ? { console: consoles.slice(0, 200), errors: errors.slice(0, 100) } : {}) } };
+		} finally {
+			page.off("request", onRequest); page.off("response", onResponse); page.off("requestfailed", onRequestFailed);
+			if (debug) { page.off("console", onConsole); page.off("pageerror", onPageError); }
+		}
+	}
+
+	private async sequence(browser: Browser, initialPage: Page, input: Json): Promise<SessionResult> {
+		if (!Array.isArray(input.steps) || input.steps.length < 1 || input.steps.length > MAX_SEQUENCE_STEPS) throw Object.assign(new Error(`steps must contain 1 to ${MAX_SEQUENCE_STEPS} operations.`), { code: "INVALID_INPUT" });
+		const maxMs = Math.min(Math.max(Number(input.maxDurationMs ?? MAX_SEQUENCE_MS), 1000), MAX_SEQUENCE_MS);
+		const deadline = Date.now() + maxMs;
+		const outcomes: Json[] = [];
+		let page = initialPage;
+		for (const [index, step] of input.steps.entries()) {
+			if (Date.now() > deadline) { outcomes.push({ index, error: { code: "SEQUENCE_TIMEOUT", message: "Sequence duration limit reached." } }); break; }
+			try {
+				if (step.type === "navigate") await page.goto(String(step.url), { waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+				else if (step.type === "reload") await page.reload({ waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+				else if (step.type === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+				else if (step.type === "forward") await page.goForward({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+				else if (step.type === "wait") await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.ms ?? 250), Math.max(deadline - Date.now(), 0))));
+				else if (step.type === "action") await this.performAction(page, step);
+				else if (step.type === "evaluate") await evaluatePage(page, String(step.expression), Math.min(Number(step.timeoutMs ?? 10_000), Math.max(deadline - Date.now(), 1)));
+				else if (step.type === "new_tab") page = await browser.newPage();
+				else throw Object.assign(new Error(`Unsupported sequence step type: ${step.type}`), { code: "INVALID_SEQUENCE_STEP" });
+				const state = await pageSummary(page);
+				if (step.expect) await this.checkExpectation(page, step.expect);
+				outcomes.push({ index, ok: true, page: state });
+			} catch (error) {
+				const value = error as { code?: string; message?: string };
+				outcomes.push({ index, ok: false, error: { code: value.code ?? "STEP_FAILED", message: value.message ?? String(error) }, page: await pageSummary(page).catch(() => null) });
+				if (input.stopOnError !== false) break;
+			}
+		}
+		return { structuredContent: { outcomes, tabs: await listTabs(browser), durationMs: maxMs - Math.max(deadline - Date.now(), 0), stopOnError: input.stopOnError !== false } };
+	}
+
+	private async checkExpectation(page: Page, expect: Json) {
+		if (expect.urlContains && !page.url().includes(String(expect.urlContains))) throw Object.assign(new Error(`Expected URL to include ${expect.urlContains}.`), { code: "EXPECTATION_FAILED" });
+		if (expect.titleContains && !(await page.title()).includes(String(expect.titleContains))) throw Object.assign(new Error(`Expected title to include ${expect.titleContains}.`), { code: "EXPECTATION_FAILED" });
+		if (expect.textVisible) {
+			const visible = await page.evaluate((text) => document.body?.innerText.includes(text) ?? false, String(expect.textVisible));
+			if (!visible) throw Object.assign(new Error(`Expected text to be visible: ${expect.textVisible}`), { code: "EXPECTATION_FAILED" });
+		}
+		if (expect.selectorVisible) {
+			const visible = await evaluatePage(page, `(()=>{const e=document.querySelector(${JSON.stringify(String(expect.selectorVisible))});if(!e)return false;const s=getComputedStyle(e);return !!(e.getClientRects().length&&s.visibility!=='hidden'&&s.display!=='none')})()`);
+			if (!visible) throw Object.assign(new Error(`Expected selector to be visible: ${expect.selectorVisible}`), { code: "EXPECTATION_FAILED" });
+		}
+	}
+
+	private async handoff(browser: Browser, page: Page, op: string, input: Json): Promise<SessionResult> {
+		const session = op === "live_view" ? await page.createCDPSession() : await browser.target().createCDPSession();
+		try {
+			let result: unknown;
+			let liveView: unknown;
+			if (op === "live_view") result = await session.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: input.mode ?? "tab", expiresInMs: Math.min(Number(input.expiresInMs ?? 300_000), 1_800_000) });
+			else if (op === "handoff") {
+				if (input.url) await page.goto(String(input.url), { waitUntil: "domcontentloaded", timeout: Math.min(Number(input.timeoutMs ?? 300_000), 120_000) });
+				result = await session.send("Cloudflare.handoff", { targetId: getTabId(page), timeout: Math.min(Number(input.timeoutMs ?? 300_000), 1_800_000), instructions: String(input.reason ?? "Please inspect and operate the browser, then complete the handoff.") });
+				const viewSession = await page.createCDPSession();
+				try { liveView = await viewSession.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: "tab", expiresInMs: Math.min(Number(input.timeoutMs ?? 300_000), 300_000) }); }
+				catch { liveView = undefined; }
+				finally { await viewSession.detach().catch(() => undefined); }
+			}
+			else if (op === "handoff_status") result = await session.send("Cloudflare.getHandoffState", { targetId: getTabId(page) });
+			else result = await session.send("Cloudflare.handoffComplete", { targetId: getTabId(page), success: input.success !== false, ...(input.reason ? { reason: String(input.reason) } : {}) });
+			return { structuredContent: { result, ...(liveView ? { liveView } : {}), page: await pageSummary(page) } };
+		} catch (error) {
+			throw Object.assign(new Error(`Cloudflare live-view or handoff command failed: ${(error as Error).message}`), { code: "HANDOFF_UNAVAILABLE" });
+		} finally { await session.detach().catch(() => undefined); }
+	}
+}
