@@ -1,5 +1,6 @@
 import OAuthProvider, { AuthorizationError, CimdFetchError } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "@modelcontextprotocol/server";
+import projectInfo from "../source-info.json" with { type: "json" };
 import { createBrowserMcpServer } from "./mcp.js";
 import type { Env } from "./types.js";
 
@@ -7,6 +8,18 @@ const OAUTH_SCOPES = ["browser:control"];
 
 function htmlEscape(value: unknown): string {
 	return String(value ?? "").replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
+}
+
+function projectInfoResponse(request: Request, origin: string): Response {
+	if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405, headers: { allow: "GET, HEAD" } });
+	const endpoints = Object.fromEntries(Object.entries(projectInfo.endpoints).map(([name, path]) => [name, new URL(path, origin).toString()]));
+	return new Response(request.method === "HEAD" ? null : JSON.stringify({ ...projectInfo, endpoints }, null, 2), {
+		headers: {
+			"content-type": "application/json; charset=utf-8",
+			"cache-control": "public, max-age=300",
+			"x-content-type-options": "nosniff",
+		},
+	});
 }
 
 function page(title: string, body: string, status = 200): Response {
@@ -132,15 +145,16 @@ function makeProvider(env: Env, request: Request) {
 			return await handler.fetch(request);
 		},
 	};
+	const configuredBase = (env.MCP_BASE_URL ?? "").trim();
+	const origin = configuredBase ? new URL(configuredBase).origin : new URL(request.url).origin;
 	const defaultHandler = {
 		fetch(request: Request, requestEnv: Env) {
 			const pathname = new URL(request.url).pathname;
+			if (pathname === "/" || pathname === "/source-info.json") return projectInfoResponse(request, origin);
 			if (pathname === "/authorize") return handleAuthorize(request, requestEnv);
 			return new Response("Not found", { status: 404 });
 		},
 	};
-	const configuredBase = (env.MCP_BASE_URL ?? "").trim();
-	const origin = configuredBase ? new URL(configuredBase).origin : new URL(request.url).origin;
 	return new OAuthProvider<Env>({
 		apiRoute: "/mcp",
 		apiHandler,

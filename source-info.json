@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0",
+  "name": "cf-browser-mcp",
+  "version": "0.1.0",
+  "description": "OAuth-protected browser-control MCP server for Cloudflare Browser Run.",
+  "projectType": "mcp-server",
+  "protocol": "MCP Streamable HTTP",
+  "runtime": ["Cloudflare Workers", "Cloudflare Browser Run", "Durable Objects", "Workers KV"],
+  "license": "MIT",
+  "source": "https://github.com/RavelloH/cf-browser-mcp",
+  "documentation": "https://github.com/RavelloH/cf-browser-mcp#readme",
+  "authentication": {
+    "protocol": "OAuth 2.1",
+    "required": true,
+    "scopes": ["browser:control"]
+  },
+  "endpoints": {
+    "mcp": "/mcp",
+    "authorizationServerMetadata": "/.well-known/oauth-authorization-server",
+    "protectedResourceMetadata": "/.well-known/oauth-protected-resource/mcp",
+    "authorization": "/authorize",
+    "token": "/oauth/token",
+    "clientRegistration": "/oauth/register"
+  },
+  "capabilities": [
+    "browser sessions and tabs",
+    "navigation and waits",
+    "accessibility snapshots and element finding",
+    "mouse, keyboard, and form interaction",
+    "screenshots and viewport control",
+    "page JavaScript and Chrome DevTools Protocol",
+    "network and debugging capture",
+    "bounded multi-step browser sequences",
+    "human browser handoff"
+  ]
+}

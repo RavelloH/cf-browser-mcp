@@ -4,6 +4,8 @@
 
 [MIT License](LICENSE) · [贡献指南](CONTRIBUTING.md) · [安全政策](SECURITY.md) · [行为准则](CODE_OF_CONDUCT.md)
 
+根路径 `/` 和 `/source-info.json` 提供公开的机器可读项目介绍 JSON，包含源码、许可证、能力概览以及 MCP/OAuth 端点。MCP 工具的完整输入结构仍通过 OAuth 授权后的 MCP `tools/list` 提供。
+
 ## 能力
 
 | 类别 | MCP 工具 |
