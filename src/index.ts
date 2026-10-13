@@ -22,13 +22,14 @@ function projectInfoResponse(request: Request, origin: string): Response {
 	});
 }
 
-function page(title: string, body: string, status = 200): Response {
+function page(title: string, body: string, status = 200, allowedFormOrigin?: string): Response {
+	const formAction = allowedFormOrigin ? `'self' ${allowedFormOrigin}` : "'self'";
 	return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${htmlEscape(title)}</title><style>body{font:16px/1.55 system-ui,sans-serif;max-width:620px;margin:9vh auto;padding:0 22px;color:#18202a}main{border:1px solid #d8dee8;border-radius:14px;padding:26px}label{display:block;margin:18px 0 8px}input{box-sizing:border-box;width:100%;padding:12px;border:1px solid #98a2b3;border-radius:8px;font:inherit}button{padding:10px 16px;border:0;border-radius:8px;background:#1458d4;color:white;font:inherit;cursor:pointer}button.secondary{background:#e9edf4;color:#18202a}.error{color:#a32222}</style></head><body><main>${body}</main></body></html>`, {
 		headers: {
 			"content-type": "text/html; charset=utf-8",
 			"cache-control": "no-store",
 			"x-content-type-options": "nosniff",
-			"content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+			"content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; base-uri 'none'; frame-ancestors 'none'`,
 			"referrer-policy": "no-referrer",
 		}, status,
 	});
@@ -65,8 +66,10 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 			const scopes = requestedScopes.map((scope) => `<li>${htmlEscape(scope)}</li>`).join("");
 			const scopeInputs = requestedScopes.map((scope) => `<input type="hidden" name="scope" value="${htmlEscape(scope)}">`).join("");
 			const clientPublisher = details.clientDomain ? `<p>客户端域名：<strong>${htmlEscape(details.clientDomain)}</strong></p>` : `<p>此客户端没有已验证的域名，显示名称由客户端自行提供。</p>`;
-			const content = `<h1>授权浏览器访问</h1><p><strong>${htmlEscape(details.clientName)}</strong> 正在请求访问你的浏览器会话。</p>${clientPublisher}<p>OAuth 回调主机：<strong>${htmlEscape(details.redirectHost)}</strong></p>${details.redirectIsLoopback ? `<p>此客户端将在这台电脑上接收 OAuth 令牌。</p>` : ""}<p>请求的权限：</p><ul>${scopes}</ul><form method="post"><input type="hidden" name="handle" value="${htmlEscape(consent.handle)}">${scopeInputs}<label for="secret">授权密钥</label><input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus><p><button name="decision" value="approve">继续授权</button> <button class="secondary" name="decision" value="deny" formnovalidate>取消</button></p></form>`;
-			const response = page("授权 cf-browser-mcp", content);
+			const callbackOrigin = new URL(authRequest.redirectUri).origin;
+			const formActionUrl = new URL(request.url);
+			const content = `<h1>授权浏览器访问</h1><p><strong>${htmlEscape(details.clientName)}</strong> 正在请求访问你的浏览器会话。</p>${clientPublisher}<p>OAuth 回调主机：<strong>${htmlEscape(details.redirectHost)}</strong></p>${details.redirectIsLoopback ? `<p>此客户端将在这台电脑上接收 OAuth 令牌。</p>` : ""}<p>请求的权限：</p><ul>${scopes}</ul><form method="post" action="${htmlEscape(`${formActionUrl.pathname}${formActionUrl.search}`)}"><input type="hidden" name="handle" value="${htmlEscape(consent.handle)}">${scopeInputs}<label for="secret">授权密钥</label><input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus><p><button name="decision" value="approve">继续授权</button> <button class="secondary" name="decision" value="deny" formnovalidate>取消</button></p></form>`;
+			const response = page("授权 cf-browser-mcp", content, 200, callbackOrigin);
 			for (const [name, value] of consent.headers) response.headers.append(name, value);
 			return response;
 		} catch (error) {
@@ -98,7 +101,9 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 			const requestedScopes = details.scope.length ? details.scope : OAUTH_SCOPES;
 			const scopes = requestedScopes.map((scope) => `<li>${htmlEscape(scope)}</li>`).join("");
 			const scopeInputs = requestedScopes.map((scope) => `<input type="hidden" name="scope" value="${htmlEscape(scope)}">`).join("");
-			return page("授权密钥不正确", `<h1>授权密钥不正确</h1><p class="error">密钥不匹配，请重试或取消。</p><p><strong>${htmlEscape(details.clientName)}</strong> 正在请求访问 <strong>${htmlEscape(details.redirectHost)}</strong>。</p><p>请求的权限：</p><ul>${scopes}</ul><form method="post"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopeInputs}<label for="secret">授权密钥</label><input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus><p><button name="decision" value="approve">继续授权</button> <button class="secondary" name="decision" value="deny" formnovalidate>取消</button></p></form>`);
+			const callbackOrigin = new URL(authRequest.redirectUri).origin;
+			const formActionUrl = new URL(request.url);
+			return page("授权密钥不正确", `<h1>授权密钥不正确</h1><p class="error">密钥不匹配，请重试或取消。</p><p><strong>${htmlEscape(details.clientName)}</strong> 正在请求访问 <strong>${htmlEscape(details.redirectHost)}</strong>。</p><p>请求的权限：</p><ul>${scopes}</ul><form method="post" action="${htmlEscape(`${formActionUrl.pathname}${formActionUrl.search}`)}"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopeInputs}<label for="secret">授权密钥</label><input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus><p><button name="decision" value="approve">继续授权</button> <button class="secondary" name="decision" value="deny" formnovalidate>取消</button></p></form>`, 200, callbackOrigin);
 		} catch (error) {
 			return oauthErrorResponse(error);
 		}
