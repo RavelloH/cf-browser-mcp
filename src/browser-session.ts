@@ -111,16 +111,13 @@ async function evaluatePageWithDialog(page: Page, expression: string, timeoutMs 
 }
 
 async function applyViewport(page: Page, viewport: PersistedViewport): Promise<void> {
-	const session = await page.createCDPSession();
-	try {
-		await session.send("Emulation.setDeviceMetricsOverride", {
-			width: viewport.width,
-			height: viewport.height,
-			deviceScaleFactor: viewport.deviceScaleFactor,
-			mobile: viewport.mobile,
-		});
-		await session.send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile });
-	} finally { await session.detach().catch(() => undefined); }
+	await page.setViewport({
+		width: viewport.width,
+		height: viewport.height,
+		deviceScaleFactor: viewport.deviceScaleFactor,
+		isMobile: viewport.mobile,
+		hasTouch: viewport.mobile,
+	});
 }
 
 function getTabId(page: Page): string {
