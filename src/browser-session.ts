@@ -44,11 +44,23 @@ type AXNode = {
 	value?: { value?: string };
 	properties?: Array<{ name: string; value?: { value?: unknown } }>;
 };
+type PersistedViewport = {
+	width: number;
+	height: number;
+	deviceScaleFactor: number;
+	mobile: boolean;
+};
+type PersistedBrowserTab = {
+	/** The previous Cloudflare target ID. It changes when Chromium is restored. */
+	tabId?: string;
+	url: string;
+	viewport: PersistedViewport | null;
+};
 type PersistedBrowserState = {
 	version: 1;
 	cookies: Json[];
 	localStorage: Record<string, Record<string, string>>;
-	tabs: Array<{ url: string; viewport: Json | null }>;
+	tabs: PersistedBrowserTab[];
 };
 const MUTATING_OPS = new Set(["new_tab", "close_tab", "navigate", "back", "forward", "reload", "wait", "action", "fill_form", "handle_dialog", "evaluate", "viewport", "mouse", "keyboard", "sequence", "network_requests", "debug_capture", "cdp", "handoff", "handoff_status", "handoff_complete"]);
 
@@ -67,6 +79,47 @@ async function evaluatePage(page: Page, expression: string, timeoutMs = 10_000):
 		const result = await session.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true, userGesture: true, timeout: Math.min(Math.max(timeoutMs, 1), 30_000) });
 		if (result.exceptionDetails) throw Object.assign(new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page evaluation failed."), { code: "PAGE_EVALUATION_ERROR" });
 		return result.result?.value ?? null;
+	} finally { await session.detach().catch(() => undefined); }
+}
+
+type DialogInfo = { type: string; message: string; defaultPrompt?: string };
+type ObservedEvaluation = { result?: unknown; dialog?: DialogInfo; dialogPending?: true };
+
+async function evaluatePageWithDialog(page: Page, expression: string, timeoutMs = 10_000): Promise<ObservedEvaluation> {
+	const session = await page.createCDPSession();
+	let resolveDialog!: (value: DialogInfo) => void;
+	const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
+	const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => resolveDialog({
+		type: String(event.type ?? "unknown"),
+		message: String(event.message ?? ""),
+		...(event.defaultPrompt ? { defaultPrompt: String(event.defaultPrompt) } : {}),
+	});
+	session.on("Page.javascriptDialogOpening", onDialog);
+	try {
+		await session.send("Page.enable");
+		const evaluation = session.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true, userGesture: true, timeout: Math.min(Math.max(timeoutMs, 1), 30_000) })
+			.then((value) => ({ kind: "result" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+		const outcome = await Promise.race([evaluation, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+		if (outcome.kind === "dialog") return { dialog: outcome.dialog, dialogPending: true };
+		if (outcome.kind === "error") throw outcome.error;
+		if (outcome.value.exceptionDetails) throw Object.assign(new Error(outcome.value.exceptionDetails.exception?.description ?? outcome.value.exceptionDetails.text ?? "Page evaluation failed."), { code: "PAGE_EVALUATION_ERROR" });
+		return { result: outcome.value.result?.value ?? null };
+	} finally {
+		session.off("Page.javascriptDialogOpening", onDialog);
+		await session.detach().catch(() => undefined);
+	}
+}
+
+async function applyViewport(page: Page, viewport: PersistedViewport): Promise<void> {
+	const session = await page.createCDPSession();
+	try {
+		await session.send("Emulation.setDeviceMetricsOverride", {
+			width: viewport.width,
+			height: viewport.height,
+			deviceScaleFactor: viewport.deviceScaleFactor,
+			mobile: viewport.mobile,
+		});
+		await session.send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile });
 	} finally { await session.detach().catch(() => undefined); }
 }
 
@@ -183,16 +236,30 @@ async function elementByTarget(page: Page, input: Json, session: CDPSession): Pr
 }
 
 async function callElement(session: CDPSession, objectId: string, functionDeclaration: string, args: unknown[] = []) {
-	const result = await session.send("Runtime.callFunctionOn", {
+	let resolveDialog!: (value: DialogInfo) => void;
+	const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
+	const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => resolveDialog({
+		type: String(event.type ?? "unknown"),
+		message: String(event.message ?? ""),
+		...(event.defaultPrompt ? { defaultPrompt: String(event.defaultPrompt) } : {}),
+	});
+	session.on("Page.javascriptDialogOpening", onDialog);
+	try {
+		const call = session.send("Runtime.callFunctionOn", {
 		objectId,
 		functionDeclaration,
 		arguments: args.map((value) => ({ value })),
 		awaitPromise: true,
 		returnByValue: true,
 		userGesture: true,
-	});
+	}, { timeout: 10_000 }).then((value) => ({ kind: "result" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+		const outcome = await Promise.race([call, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+		if (outcome.kind === "dialog") throw Object.assign(new Error(`A JavaScript ${outcome.dialog.type} dialog is open: ${outcome.dialog.message}`), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true, dialog: outcome.dialog });
+		if (outcome.kind === "error") throw outcome.error;
+		const result = outcome.value;
 	if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? "Page script failed.");
 	return result.result?.value;
+	} finally { session.off("Page.javascriptDialogOpening", onDialog); }
 }
 
 async function elementCenter(session: CDPSession, backendDOMNodeId: number) {
@@ -222,12 +289,12 @@ async function snapshot(page: Page, input: Json) {
 }
 
 async function browserStatus(env: Env, sessionId: string | undefined) {
-	if (!sessionId) return { active: false, browserSessionId: null, tabs: [] };
+	if (!sessionId) return { active: false, browserSessionId: null, tabs: null, tabsKnown: false };
 	try {
 		const sessions = await puppeteer.sessions(env.BROWSER as any);
-		return { active: sessions.some((session) => session.sessionId === sessionId), browserSessionId: undefined, tabs: [] };
+		return { active: sessions.some((session) => session.sessionId === sessionId), browserSessionId: undefined, tabs: null, tabsKnown: false };
 	} catch {
-		return { active: null, browserSessionId: undefined, tabs: [], error: "Could not query Browser Run session metadata." };
+		return { active: null, browserSessionId: undefined, tabs: null, tabsKnown: false, error: "Could not query Browser Run session metadata." };
 	}
 }
 
@@ -241,80 +308,66 @@ export class BrowserSession extends DurableObject<Env> {
 	async fetch(request: Request): Promise<Response> {
 		if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { allow: "POST" } });
 		const startedAt = Date.now();
+		let input: SessionRequest;
+		try { input = await request.json() as SessionRequest; }
+		catch { return jsonResponse({ isError: true, code: "INVALID_INPUT", message: "Request body must be valid JSON.", durationMs: Date.now() - startedAt }); }
+		// A modal dialog can suspend the request that opened it while holding the
+		// session queue. Dismiss/accept it out of band so that request can resume.
+		if (input.op === "handle_dialog") {
+			try {
+				const result = await this.handleDialogOutOfBand(input);
+				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				return jsonResponse(result);
+			} catch (error) {
+				const value = error as { code?: string; message?: string; [key: string]: unknown };
+				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
+			}
+		}
 		const previous = this.lock;
 		let release!: () => void;
 		this.lock = new Promise<void>((resolve) => { release = resolve; });
 		await previous;
 		try {
-			const input = await request.json() as SessionRequest;
 			const result = await this.dispatch(input);
 			result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
 			return jsonResponse(result);
 		} catch (error) {
 			const value = error as { code?: string; message?: string; [key: string]: unknown };
-			return jsonResponse({ isError: true, code: value.code ?? "BROWSER_ERROR", message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.snapshotId ? { snapshotId: value.snapshotId } : {}), ...(value.matches ? { matches: value.matches } : {}), ...(value.persistenceWarning ? { persistenceWarning: value.persistenceWarning } : {}) });
+			const code = this.errorCode(error);
+			if (code === "BROWSER_SESSION_LOST" || code === "BROWSER_CONNECTION_FAILED") console.warn("Browser session operation failed", { op: input.op, code, message: String(value.message ?? error).slice(0, 500), durationMs: Date.now() - startedAt });
+			return jsonResponse({ isError: true, code, message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.snapshotId ? { snapshotId: value.snapshotId } : {}), ...(value.matches ? { matches: value.matches } : {}), ...(value.persistenceWarning ? { persistenceWarning: value.persistenceWarning } : {}), ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
 		} finally {
 			release();
 		}
 	}
 
-	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
-
-	private async restoreState(browser: Browser): Promise<void> {
-		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-		if (!state || state.version !== 1) return;
-		const pages = await browser.pages();
-		const anchor = pages[0] ?? await browser.newPage();
-		if (state.cookies.length) {
-			const session = await anchor.createCDPSession();
-			try { await session.send("Network.setCookies", { cookies: state.cookies as any }); }
-			finally { await session.detach().catch(() => undefined); }
-		}
-		const urls = state.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).slice(0, 30);
-		const restoreTargets: Array<{ page: Page; url: string }> = [];
-		for (const [index, tabState] of urls.entries()) {
-			const page = index === 0 ? anchor : await browser.newPage();
-			if (tabState.viewport) await page.setViewport({ width: Number(tabState.viewport.width ?? 1280), height: Number(tabState.viewport.height ?? 720), deviceScaleFactor: Number(tabState.viewport.deviceScaleFactor ?? 1) });
-			await page.evaluateOnNewDocument((origins: Record<string, Record<string, string>>) => {
-				const values = origins[location.origin];
-				if (!values) return;
-				try { for (const [key, value] of Object.entries(values)) localStorage.setItem(key, value); } catch { /* The page may disable storage. */ }
-			}, state.localStorage);
-			restoreTargets.push({ page, url: tabState.url });
-		}
-		for (let offset = 0; offset < restoreTargets.length; offset += 5) {
-			await Promise.all(restoreTargets.slice(offset, offset + 5).map(async ({ page, url }) => {
-				try { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 }); } catch { /* Keep the tab even when the site is temporarily unavailable. */ }
-			}));
-		}
+	private errorCode(error: unknown): string {
+		const value = error as { code?: string; message?: string };
+		const message = value.message ?? String(error);
+		if (/target closed|targetcloseerror|session closed|websocket.*closed|connection.*closed|browser disconnected/i.test(message)) return "BROWSER_SESSION_LOST";
+		if (/timed out|timeout/i.test(message)) return "CDP_COMMAND_TIMEOUT";
+		if (value.code) return value.code;
+		return "BROWSER_ERROR";
 	}
 
-	private async persistState(browser: Browser): Promise<void> {
-		const pages = await browser.pages();
-		const anchor = pages[0] ?? await browser.newPage();
-		const cookieSession = await anchor.createCDPSession();
-		let cookies: Json[] = [];
+	private async handleDialogOutOfBand(request: SessionRequest): Promise<SessionResult> {
+		const input = request.input ?? {};
+		const connection = await this.connectBrowser(false);
+		if (!connection.browser) throw Object.assign(new Error("There is no active browser session to handle a JavaScript dialog."), { code: "NO_ACTIVE_BROWSER" });
+		const browser = connection.browser;
 		try {
-			const result = await (cookieSession as any).send("Network.getAllCookies") as { cookies?: Json[] };
-			cookies = (result.cookies ?? []).slice(0, 3000).map((cookie) => {
-				const { session, ...cookieParam } = cookie;
-				if (session || Number(cookieParam.expires) < 0) delete cookieParam.expires;
-				return cookieParam;
-			});
-		} finally { await cookieSession.detach().catch(() => undefined); }
-		const localStorage: Record<string, Record<string, string>> = {};
-		const tabs: PersistedBrowserState["tabs"] = [];
-		for (const page of pages.slice(0, 30)) {
-			const url = page.url();
-			if (/^https?:\/\//i.test(url)) tabs.push({ url, viewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })).catch(() => null) });
-			const values = await page.evaluate(() => {
-				const result: Record<string, string> = {};
-				try { for (let i = 0; i < Math.min(window.localStorage.length, 500); i++) { const key = window.localStorage.key(i); if (key) result[key] = String(window.localStorage.getItem(key) ?? "").slice(0, 10_000); } } catch { /* The page may disable storage. */ }
-				return result;
-			}).catch(() => null);
-			if (values && /^https?:\/\//i.test(url)) localStorage[new URL(url).origin] = values;
-		}
-		let state: PersistedBrowserState = { version: 1, cookies, localStorage, tabs };
+			const page = await pickPage(browser, input.tabId ? String(input.tabId) : undefined);
+			const session = await page.createCDPSession();
+			try {
+				await session.send("Page.handleJavaScriptDialog", { accept: Boolean(input.accept), ...(input.promptText !== undefined ? { promptText: String(input.promptText) } : {}) });
+				return { structuredContent: { handled: true, tabId: getTabId(page), url: page.url() } };
+			} finally { await session.detach().catch(() => undefined); }
+		} finally { browser.disconnect(); }
+	}
+
+	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
+
+	private async saveStateRecord(state: PersistedBrowserState): Promise<void> {
 		let serialized = JSON.stringify(state);
 		if (new TextEncoder().encode(serialized).byteLength > 1_500_000) {
 			state = { ...state, localStorage: {}, tabs: state.tabs.slice(0, 15) };
@@ -328,11 +381,162 @@ export class BrowserSession extends DurableObject<Env> {
 		await this.ctx.storage.put("browserStateRecord", { state, hash });
 	}
 
-	private async connectBrowser(allowLaunch: boolean): Promise<{ browser?: Browser; sessionId?: string; created: boolean }> {
+	private async restoreState(browser: Browser): Promise<Array<{ previousTabId: string; tabId: string; url: string }>> {
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state || state.version !== 1) {
+			for (const page of await browser.pages()) if (page.url() === "about:blank") await page.close().catch(() => undefined);
+			return [];
+		}
+		const pages = await browser.pages();
+		const anchor = pages[0] ?? await browser.newPage();
+		const urls = state.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).slice(0, 30);
+		if (state.cookies.length) {
+			const session = await anchor.createCDPSession();
+			try { await session.send("Network.setCookies", { cookies: state.cookies as any }); }
+			finally { await session.detach().catch(() => undefined); }
+		}
+		const restoreTargets: Array<{ page: Page; tab: PersistedBrowserTab }> = [];
+		for (const [index, tabState] of urls.entries()) {
+			const page = index === 0 ? anchor : await browser.newPage();
+			if (tabState.viewport) await applyViewport(page, {
+				width: Number(tabState.viewport.width ?? 800),
+				height: Number(tabState.viewport.height ?? 600),
+				deviceScaleFactor: Number(tabState.viewport.deviceScaleFactor ?? 1),
+				mobile: Boolean(tabState.viewport.mobile),
+			});
+			await page.evaluateOnNewDocument((origins: Record<string, Record<string, string>>) => {
+				const values = origins[location.origin];
+				if (!values) return;
+				try { for (const [key, value] of Object.entries(values)) localStorage.setItem(key, value); } catch { /* The page may disable storage. */ }
+			}, state.localStorage);
+			restoreTargets.push({ page, tab: tabState });
+		}
+		for (let offset = 0; offset < restoreTargets.length; offset += 5) {
+			await Promise.all(restoreTargets.slice(offset, offset + 5).map(async ({ page, tab }) => {
+				try { await page.goto(tab.url, { waitUntil: "domcontentloaded", timeout: 15_000 }); } catch { /* Keep the tab even when the site is temporarily unavailable. */ }
+			}));
+		}
+		const mappings = restoreTargets.flatMap(({ page, tab }) => tab.tabId ? [{ previousTabId: tab.tabId, tabId: getTabId(page), url: tab.url }] : []);
+		if (restoreTargets.length) {
+			const restoredState: PersistedBrowserState = {
+				...state,
+				tabs: restoreTargets.map(({ page, tab }) => ({ tabId: getTabId(page), url: tab.url, viewport: tab.viewport ?? null })),
+			};
+			await this.saveStateRecord(restoredState);
+		}
+		const restoredPages = new Set(restoreTargets.map(({ page }) => page));
+		for (const page of await browser.pages()) if (!restoredPages.has(page) && page.url() === "about:blank") await page.close().catch(() => undefined);
+		return mappings;
+	}
+
+	private async persistState(browser: Browser): Promise<void> {
+		const pages = await browser.pages();
+		const anchor = pages[0] ?? await browser.newPage();
+		const temporaryAnchor = pages.length === 0;
+		const cookieSession = await anchor.createCDPSession();
+		let cookies: Json[] = [];
+		try {
+			const result = await (cookieSession as any).send("Network.getAllCookies") as { cookies?: Json[] };
+			cookies = (result.cookies ?? []).slice(0, 3000).map((cookie) => {
+				const { session, ...cookieParam } = cookie;
+				if (session || Number(cookieParam.expires) < 0) delete cookieParam.expires;
+				return cookieParam;
+			});
+		} finally {
+			await cookieSession.detach().catch(() => undefined);
+			if (temporaryAnchor) await anchor.close().catch(() => undefined);
+		}
+		const previousState = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		const previousViewports = new Map((previousState?.tabs ?? []).filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
+		const localStorage: Record<string, Record<string, string>> = {};
+		const tabs: PersistedBrowserState["tabs"] = [];
+		for (const page of pages.slice(0, 30)) {
+			const url = page.url();
+			const tabId = getTabId(page);
+			const viewport = previousViewports.get(tabId) ?? null;
+			if (/^https?:\/\//i.test(url) || viewport) tabs.push({ tabId, url, viewport });
+			const values = await page.evaluate(() => {
+				const result: Record<string, string> = {};
+				try { for (let i = 0; i < Math.min(window.localStorage.length, 500); i++) { const key = window.localStorage.key(i); if (key) result[key] = String(window.localStorage.getItem(key) ?? "").slice(0, 10_000); } } catch { /* The page may disable storage. */ }
+				return result;
+			}).catch(() => null);
+			if (values && /^https?:\/\//i.test(url)) localStorage[new URL(url).origin] = values;
+		}
+		const state: PersistedBrowserState = { version: 1, cookies, localStorage, tabs };
+		await this.saveStateRecord(state);
+	}
+
+	private async saveViewportOverride(page: Page, viewport: PersistedViewport): Promise<void> {
+		const record = await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord");
+		const state: PersistedBrowserState = record?.state ?? { version: 1, cookies: [], localStorage: {}, tabs: [] };
+		const tabId = getTabId(page);
+		const url = page.url();
+		const tabs = state.tabs.filter((tab) => tab.tabId !== tabId);
+		tabs.push({ tabId, url, viewport });
+		await this.saveStateRecord({ ...state, tabs });
+	}
+
+	private async applySavedViewports(browser: Browser): Promise<void> {
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state) return;
+		const viewports = new Map(state.tabs.filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
+		for (const page of await browser.pages()) {
+			const viewport = viewports.get(getTabId(page));
+			if (viewport) await applyViewport(page, {
+				width: Number(viewport.width ?? 800),
+				height: Number(viewport.height ?? 600),
+				deviceScaleFactor: Number(viewport.deviceScaleFactor ?? 1),
+				mobile: Boolean(viewport.mobile),
+			});
+		}
+	}
+
+	private async applySavedViewport(browser: Browser, tabId?: string): Promise<void> {
+		const page = await pickPage(browser, tabId, false);
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		const viewport = state?.tabs.find((tab) => tab.tabId === getTabId(page))?.viewport;
+		if (viewport) await applyViewport(page, {
+			width: Number(viewport.width ?? 800),
+			height: Number(viewport.height ?? 600),
+			deviceScaleFactor: Number(viewport.deviceScaleFactor ?? 1),
+			mobile: Boolean(viewport.mobile),
+		});
+	}
+
+	private async reconcileTabIds(browser: Browser): Promise<Array<{ previousTabId: string; tabId: string; url: string }>> {
+		const record = await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord");
+		const state = record?.state;
+		if (!state?.tabs.length) return [];
+		const pages = await browser.pages();
+		const usedPages = new Set<Page>();
+		const replacements = new Map<string, Page>();
+		for (const saved of state.tabs) {
+			if (!saved.tabId || !/^https?:\/\//i.test(saved.url)) continue;
+			const exact = pages.find((page) => getTabId(page) === saved.tabId);
+			if (exact) { usedPages.add(exact); continue; }
+			const sameUrl = pages.find((page) => !usedPages.has(page) && page.url() === saved.url);
+			if (sameUrl) { usedPages.add(sameUrl); replacements.set(saved.tabId, sameUrl); }
+		}
+		if (!replacements.size) return [];
+		const mappings = [...replacements].map(([previousTabId, page]) => ({ previousTabId, tabId: getTabId(page), url: page.url() }));
+		const tabs = state.tabs.map((tab) => {
+			const replacement = tab.tabId ? replacements.get(tab.tabId) : undefined;
+			return replacement ? { ...tab, tabId: getTabId(replacement), url: replacement.url() } : tab;
+		});
+		await this.saveStateRecord({ ...state, tabs });
+		return mappings;
+	}
+
+	private async connectBrowser(allowLaunch: boolean): Promise<{ browser?: Browser; sessionId?: string; created: boolean; tabIdMappings?: Array<{ previousTabId: string; tabId: string; url: string }> }> {
 		let sessionId = await this.storedSessionId();
 		if (sessionId) {
 			try { return { browser: await puppeteer.connect(this.env.BROWSER as any, sessionId), sessionId, created: false }; }
-			catch {
+			catch (error) {
+				console.warn("Browser Run reconnect failed", { message: String((error as Error)?.message ?? error).slice(0, 500) });
+				const stillActive = await puppeteer.sessions(this.env.BROWSER as any)
+					.then((sessions) => sessions.some((session) => session.sessionId === sessionId))
+					.catch(() => false);
+				if (stillActive) throw Object.assign(new Error("The Browser Run session still exists, but its CDP connection failed. Retry the operation; the session will not be replaced automatically."), { code: "BROWSER_CONNECTION_FAILED" });
 				await this.ctx.storage.delete("browserSessionId");
 				sessionId = undefined;
 			}
@@ -340,15 +544,17 @@ export class BrowserSession extends DurableObject<Env> {
 		if (!allowLaunch) return { created: false };
 		const browser = await puppeteer.launch(this.env.BROWSER as any, { keep_alive: DEFAULT_KEEP_ALIVE_MS });
 		sessionId = browser.sessionId();
+		let tabIdMappings: Array<{ previousTabId: string; tabId: string; url: string }> = [];
 		try {
 			await this.ctx.storage.put("browserSessionId", sessionId);
-			await this.restoreState(browser);
+			tabIdMappings = await this.restoreState(browser);
+			console.info("Browser session started", { tabIdMappingCount: tabIdMappings.length });
 		} catch (error) {
 			try { await browser.close(); } catch { browser.disconnect(); }
 			await this.ctx.storage.delete("browserSessionId");
 			throw Object.assign(new Error(`Could not restore the saved browser state: ${(error as Error).message}`), { code: "RESTORE_FAILED" });
 		}
-		return { browser, sessionId, created: true };
+		return { browser, sessionId, created: true, tabIdMappings };
 	}
 
 	private async dispatch(request: SessionRequest): Promise<SessionResult> {
@@ -357,7 +563,7 @@ export class BrowserSession extends DurableObject<Env> {
 			const sessionId = await this.storedSessionId();
 			const status = await browserStatus(this.env, sessionId);
 			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-			return { structuredContent: { ...status, restorableTabs: saved?.tabs.map((tab) => ({ url: tab.url })) ?? [] } };
+			return { structuredContent: { ...status, restorableTabs: saved?.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).map((tab) => ({ previousTabId: tab.tabId, url: tab.url })) ?? [] } };
 		}
 		if (op === "close_session") {
 			const sessionId = await this.storedSessionId();
@@ -389,21 +595,36 @@ export class BrowserSession extends DurableObject<Env> {
 		const connection = await this.connectBrowser(allowLaunch);
 		if (!connection.browser) {
 			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-			return { structuredContent: { active: false, tabs: [], restorableTabs: saved?.tabs.map((tab) => ({ url: tab.url })) ?? [] }, content: [{ type: "text", text: saved?.tabs.length ? "Browser is idle; saved cookies and site storage will be restored when the next browser operation starts." : "Browser session has not started. Call browser_navigate or browser_new_tab to start one." }] };
+			return { structuredContent: { active: false, tabs: [], tabsKnown: true, restorableTabs: saved?.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).map((tab) => ({ previousTabId: tab.tabId, url: tab.url })) ?? [] }, content: [{ type: "text", text: saved?.tabs.length ? "Browser is idle; saved cookies and site storage will be restored when the next browser operation starts." : "Browser session has not started. Call browser_navigate or browser_new_tab to start one." }] };
 		}
 		const browser = connection.browser;
+		if (!connection.created) {
+			const liveMappings = await this.reconcileTabIds(browser);
+			if (liveMappings.length) connection.tabIdMappings = [...(connection.tabIdMappings ?? []), ...liveMappings];
+		}
+		let operationInput = input;
+		if (typeof input.tabId === "string") {
+			const remapped = connection.tabIdMappings?.find((mapping) => mapping.previousTabId === input.tabId);
+			if (remapped) operationInput = { ...input, tabId: remapped.tabId };
+		}
 		if (op === "resume") {
-			try { return { structuredContent: { active: true, restored: connection.created, tabs: await listTabs(browser) } }; }
+			try {
+				await this.applySavedViewports(browser);
+				return { structuredContent: { active: true, restored: connection.created, tabs: await listTabs(browser), ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
+			}
 			finally { browser.disconnect(); }
 		}
 		let result: SessionResult | undefined;
 		let operationError: unknown;
 		try {
-			result = await this.runOperation(browser, op, input);
+			if (op === "list_tabs") await this.applySavedViewports(browser);
+			else if (op !== "new_tab" && op !== "close_tab") await this.applySavedViewport(browser, operationInput.tabId ? String(operationInput.tabId) : undefined);
+			result = await this.runOperation(browser, op, operationInput);
+			if (connection.tabIdMappings?.length && result.structuredContent) result.structuredContent = { ...result.structuredContent, tabIdMappings: connection.tabIdMappings };
 		} catch (error) {
 			operationError = error;
 		} finally {
-			if (MUTATING_OPS.has(op)) {
+			if (MUTATING_OPS.has(op) && result?.structuredContent?.dialogPending !== true && !(operationError as Json | undefined)?.dialogPending) {
 				try { await this.persistState(browser); }
 				catch (error) {
 					if (!operationError && result) result.structuredContent = { ...(result.structuredContent ?? {}), persistenceWarning: (error as Error).message };
@@ -412,7 +633,10 @@ export class BrowserSession extends DurableObject<Env> {
 			}
 			browser.disconnect();
 		}
-		if (operationError) throw operationError;
+		if (operationError) {
+			if (connection.tabIdMappings?.length && operationError && typeof operationError === "object") (operationError as Json).tabIdMappings = connection.tabIdMappings;
+			throw operationError;
+		}
 		return result!;
 	}
 
@@ -431,7 +655,9 @@ export class BrowserSession extends DurableObject<Env> {
 		if (op === "close_tab") {
 			const page = await pickPage(browser, String(input.tabId ?? ""));
 			const tabId = getTabId(page);
+			const wasLastRealTab = page.url() !== "about:blank" && (await browser.pages()).filter((candidate) => candidate.url() !== "about:blank").length === 1;
 			await page.close();
+			if (wasLastRealTab) for (const remaining of await browser.pages()) if (remaining.url() === "about:blank") await remaining.close().catch(() => undefined);
 			return { structuredContent: { closed: true, tabId, tabs: await listTabs(browser) } };
 		}
 		const page = await pickPage(browser, input.tabId ? String(input.tabId) : undefined, true);
@@ -476,26 +702,45 @@ export class BrowserSession extends DurableObject<Env> {
 			return { content: [{ type: "text", text: JSON.stringify({ tabId: getTabId(page), url: page.url(), mimeType }) }, { type: "image", data, mimeType }], structuredContent: { tabId: getTabId(page), url: page.url(), mimeType } };
 		}
 		if (op === "evaluate") {
-			const value = await evaluatePage(page, String(input.expression), Number(input.timeoutMs ?? 10_000));
+			const evaluation = await evaluatePageWithDialog(page, String(input.expression), Number(input.timeoutMs ?? 10_000));
+			if (evaluation.dialogPending) {
+				const prompt = "A JavaScript dialog is open. Call browser_handle_dialog to accept or dismiss it.";
+				return { structuredContent: { dialogPending: true, dialog: evaluation.dialog, page: { tabId: getTabId(page), url: page.url() } }, content: [{ type: "text", text: prompt }] };
+			}
+			const value = evaluation.result;
 			const serialized = JSON.stringify(value ?? null);
 			const truncated = serialized.length > MAX_TEXT;
 			const bounded = truncated ? serialized.slice(0, MAX_TEXT) : value ?? null;
 			return { structuredContent: { result: bounded, truncated, page: await pageSummary(page) }, content: [{ type: "text", text: safeText(value ?? null) }] };
 		}
 		if (op === "viewport") {
-			const session = await page.createCDPSession();
-			try {
-				await session.send("Emulation.setDeviceMetricsOverride", { width: Number(input.width), height: Number(input.height), deviceScaleFactor: Number(input.deviceScaleFactor ?? 1), mobile: Boolean(input.mobile) });
-				return { structuredContent: { page: await pageSummary(page) } };
-			} finally { await session.detach().catch(() => undefined); }
+			const viewport: PersistedViewport = {
+				width: Number(input.width),
+				height: Number(input.height),
+				deviceScaleFactor: Number(input.deviceScaleFactor ?? 1),
+				mobile: Boolean(input.mobile),
+			};
+			await applyViewport(page, viewport);
+			await this.saveViewportOverride(page, viewport);
+			return { structuredContent: { viewport, page: await pageSummary(page) } };
 		}
 		if (op === "mouse") {
 			const session = await page.createCDPSession();
+			let dialogInfo: DialogInfo | undefined;
+			let resolveDialog!: (value: DialogInfo) => void;
+			const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
+			const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => {
+				dialogInfo = { type: String(event.type ?? "unknown"), message: String(event.message ?? ""), ...(event.defaultPrompt ? { defaultPrompt: String(event.defaultPrompt) } : {}) };
+				resolveDialog(dialogInfo);
+			};
+			session.on("Page.javascriptDialogOpening", onDialog);
 			try {
+				await session.send("Page.enable");
 				const action = String(input.action ?? "move");
 				const dimensions = await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1280, height: 720 }));
 				const x = Number(input.x ?? Math.floor(dimensions.width / 2)), y = Number(input.y ?? Math.floor(dimensions.height / 2));
 				if (![x, y].every(Number.isFinite)) throw Object.assign(new Error("Mouse coordinates must be finite numbers."), { code: "INVALID_INPUT" });
+				const dispatchStartedAt = Date.now();
 				if (action === "click") {
 					await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
 					await session.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
@@ -511,13 +756,37 @@ export class BrowserSession extends DurableObject<Env> {
 					for (let step = 1; step <= 6; step++) await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x + (endX - x) * step / 6, y: y + (endY - y) * step / 6, button: "left", buttons: 1 });
 					await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left" });
 				} else throw Object.assign(new Error(`Unknown mouse action: ${action}`), { code: "INVALID_ACTION" });
-				return { structuredContent: { action, x, y, page: await pageSummary(page) } };
-			} finally { await session.detach().catch(() => undefined); }
+				const inputDispatchMs = Date.now() - dispatchStartedAt;
+				const settleStartedAt = Date.now();
+				await Promise.race([delay(action === "click" ? 250 : 50), dialogOpened]);
+				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
+				if (dialogInfo) return { structuredContent: { action, x, y, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				const metadataStartedAt = Date.now();
+				const metadata = pageSummary(page).then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+				timings.metadataMs = Date.now() - metadataStartedAt;
+				if (outcome.kind === "dialog") return { structuredContent: { action, x, y, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (outcome.kind === "error") throw outcome.error;
+				return { structuredContent: { action, x, y, page: outcome.value, timings } };
+			} finally {
+				session.off("Page.javascriptDialogOpening", onDialog);
+				await session.detach().catch(() => undefined);
+			}
 		}
 		if (op === "keyboard") {
 			const session = await page.createCDPSession();
+			let dialogInfo: DialogInfo | undefined;
+			let resolveDialog!: (value: DialogInfo) => void;
+			const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
+			const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => {
+				dialogInfo = { type: String(event.type ?? "unknown"), message: String(event.message ?? ""), ...(event.defaultPrompt ? { defaultPrompt: String(event.defaultPrompt) } : {}) };
+				resolveDialog(dialogInfo);
+			};
+			session.on("Page.javascriptDialogOpening", onDialog);
 			try {
+				await session.send("Page.enable");
 				const action = String(input.action ?? "press");
+				const dispatchStartedAt = Date.now();
 				if (action === "type") await session.send("Input.insertText", { text: String(input.text ?? "") });
 				else {
 					const key = String(input.key ?? "Enter");
@@ -530,8 +799,22 @@ export class BrowserSession extends DurableObject<Env> {
 					await session.send("Input.dispatchKeyEvent", { type: eventType, key, code, modifiers, ...(input.text ? { text: String(input.text) } : {}), ...(vkey !== undefined ? { windowsVirtualKeyCode: vkey } : {}) });
 					if (action === "press") await session.send("Input.dispatchKeyEvent", { type: "keyUp", key, code, modifiers, ...(vkey !== undefined ? { windowsVirtualKeyCode: vkey } : {}) });
 				}
-				return { structuredContent: { action, page: await pageSummary(page) } };
-			} finally { await session.detach().catch(() => undefined); }
+				const inputDispatchMs = Date.now() - dispatchStartedAt;
+				const settleStartedAt = Date.now();
+				await Promise.race([delay(150), dialogOpened]);
+				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
+				if (dialogInfo) return { structuredContent: { action, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				const metadataStartedAt = Date.now();
+				const metadata = pageSummary(page).then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+				timings.metadataMs = Date.now() - metadataStartedAt;
+				if (outcome.kind === "dialog") return { structuredContent: { action, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (outcome.kind === "error") throw outcome.error;
+				return { structuredContent: { action, page: outcome.value, timings } };
+			} finally {
+				session.off("Page.javascriptDialogOpening", onDialog);
+				await session.detach().catch(() => undefined);
+			}
 		}
 		if (op === "handle_dialog") {
 			const session = await page.createCDPSession();
@@ -561,27 +844,41 @@ export class BrowserSession extends DurableObject<Env> {
 	private async performAction(page: Page, input: Json): Promise<SessionResult> {
 		const action = String(input.action ?? "");
 		const session = await page.createCDPSession();
+		let dialogInfo: DialogInfo | undefined;
+		let resolveDialog!: (value: DialogInfo) => void;
+		const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
+		const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => {
+			dialogInfo = { type: String(event.type ?? "unknown"), message: String(event.message ?? ""), ...(event.defaultPrompt ? { defaultPrompt: String(event.defaultPrompt) } : {}) };
+			resolveDialog(dialogInfo);
+		};
+		session.on("Page.javascriptDialogOpening", onDialog);
 		try {
+			await session.send("Page.enable");
+			const sendInput = (method: string, params: Json) => (session as any).send(method, params, { timeout: 5_000 });
+			const targetStartedAt = Date.now();
 			const target = await elementByTarget(page, input, session);
+			const targetResolutionMs = Date.now() - targetStartedAt;
 			let result: unknown;
+			const dispatchStartedAt = Date.now();
+			try {
 			if (action === "click" || action === "hover") {
 				const center = await elementCenter(session, target.backendDOMNodeId);
 				if (action === "click") {
-					await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
-					await session.send("Input.dispatchMouseEvent", { type: "mousePressed", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
-					await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
-				} else await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
+					await sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
+					await sendInput("Input.dispatchMouseEvent", { type: "mousePressed", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+					await sendInput("Input.dispatchMouseEvent", { type: "mouseReleased", ...center, button: input.button ?? "left", clickCount: Number(input.clickCount ?? 1) });
+				} else await sendInput("Input.dispatchMouseEvent", { type: "mouseMoved", ...center });
 			} else if (action === "fill") {
 				result = await callElement(session, target.objectId, `function(value){const e=this;const proto=e instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:e instanceof HTMLInputElement?HTMLInputElement.prototype:null;const setter=proto&&Object.getOwnPropertyDescriptor(proto,'value')?.set;if(setter)setter.call(e,value);else if(e.isContentEditable)e.textContent=value;else throw new Error('Target is not an editable field');e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return {tag:e.tagName,value:e.value??e.textContent};}`, [String(input.value ?? "")]);
 			} else if (action === "type") {
 				await callElement(session, target.objectId, "function(){this.focus();}");
-				await session.send("Input.insertText", { text: String(input.text ?? "") });
+				await sendInput("Input.insertText", { text: String(input.text ?? "") });
 			} else if (action === "press_key") {
 				await callElement(session, target.objectId, "function(){this.focus();}");
 				const key = String(input.key ?? "Enter");
-				await session.send("Input.dispatchKeyEvent", { type: "keyDown", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
-				if (key.length === 1) await session.send("Input.dispatchKeyEvent", { type: "char", text: key, key });
-				await session.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
+				await sendInput("Input.dispatchKeyEvent", { type: "keyDown", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
+				if (key.length === 1) await sendInput("Input.dispatchKeyEvent", { type: "char", text: key, key });
+				await sendInput("Input.dispatchKeyEvent", { type: "keyUp", key, code: keyCode(key), windowsVirtualKeyCode: virtualKeyCode(key) });
 			} else if (action === "select_option") {
 				result = await callElement(session, target.objectId, `function(value){if(!(this instanceof HTMLSelectElement))throw new Error('Target is not a select');const values=Array.isArray(value)?value.map(String):[String(value)];for(const option of this.options)option.selected=values.includes(option.value);this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return {value:this.value,selected:[...this.selectedOptions].map(o=>({value:o.value,text:o.text}))};}`, [input.value]);
 			} else if (action === "check" || action === "uncheck") {
@@ -589,15 +886,38 @@ export class BrowserSession extends DurableObject<Env> {
 			} else if (action === "focus") await callElement(session, target.objectId, "function(){this.focus();}");
 			else if (action === "scroll_into_view") await session.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: target.backendDOMNodeId });
 			else throw Object.assign(new Error(`Unsupported action: ${action}`), { code: "INVALID_ACTION" });
-			await delay(Number(input.afterMs ?? 100));
-			return { structuredContent: { action, result, page: await pageSummary(page), snapshot: input.includeSnapshot ? await snapshot(page, {}) : undefined } };
-		} finally { await session.detach().catch(() => undefined); }
+			} catch (error) {
+				const value = error as { dialogPending?: boolean; dialog?: DialogInfo };
+				if (!dialogInfo && !value.dialogPending) throw error;
+				dialogInfo ??= value.dialog;
+				return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings: { targetResolutionMs, inputDispatchMs: Date.now() - dispatchStartedAt } } };
+			}
+			const inputDispatchMs = Date.now() - dispatchStartedAt;
+			const requestedSettleMs = Math.max(Number(input.afterMs ?? 100), action === "click" ? 250 : 0);
+			const settleStartedAt = Date.now();
+			await Promise.race([delay(requestedSettleMs), dialogOpened]);
+			const settleMs = Date.now() - settleStartedAt;
+			const timings: Json = { targetResolutionMs, inputDispatchMs, settleMs };
+			if (dialogInfo) return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			const metadataStartedAt = Date.now();
+			const metadata = (async () => ({ page: await pageSummary(page), snapshot: input.includeSnapshot ? await snapshot(page, {}) : undefined }))()
+				.then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+			const metadataOutcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+			timings.metadataMs = Date.now() - metadataStartedAt;
+			if (metadataOutcome.kind === "dialog") return { structuredContent: { action, result, dialog: metadataOutcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			if (metadataOutcome.kind === "error") throw metadataOutcome.error;
+			return { structuredContent: { action, result, ...metadataOutcome.value, timings } };
+		} finally {
+			session.off("Page.javascriptDialogOpening", onDialog);
+			await session.detach().catch(() => undefined);
+		}
 	}
 
 	private async fillForm(page: Page, input: Json): Promise<SessionResult> {
 		if (!Array.isArray(input.fields) || input.fields.length > 100) throw Object.assign(new Error("fields must contain at most 100 field definitions."), { code: "INVALID_INPUT" });
 		const session = await page.createCDPSession();
 		try {
+			await session.send("Page.enable");
 			const resolved = [];
 			for (const field of input.fields) resolved.push({ field, target: await elementByTarget(page, field, session) });
 			const results = [];
@@ -617,14 +937,25 @@ export class BrowserSession extends DurableObject<Env> {
 		const requests: Json[] = [];
 		const consoles: Json[] = [];
 		const errors: Json[] = [];
+		const filters = (input.filters ?? {}) as Json;
+		const resourceTypes = Array.isArray(filters.resourceTypes) ? new Set(filters.resourceTypes.map(String)) : undefined;
+		const urlContains = String(filters.urlContains ?? "");
+		const includeHeaders = filters.includeHeaders !== false;
+		const maxRequests = Math.min(Math.max(Number(filters.maxRequests ?? 100), 1), 500);
+		let droppedRequests = 0;
 		const requestsByUrl = new Map<any, Json>();
 		const onRequest = (request: any) => {
-			if (requests.length >= 500) return;
-			const item = { url: request.url(), method: request.method(), resourceType: request.resourceType(), requestHeaders: safeHeaders(request.headers()) };
+			if ((resourceTypes && !resourceTypes.has(request.resourceType())) || (urlContains && !request.url().includes(urlContains))) return;
+			if (requests.length >= maxRequests) { droppedRequests++; return; }
+			const item: Json = { url: request.url(), method: request.method(), resourceType: request.resourceType() };
+			if (includeHeaders) item.requestHeaders = safeHeaders(request.headers());
 			requests.push(item);
 			requestsByUrl.set(request, item);
 		};
-		const onResponse = (response: any) => { const item = requestsByUrl.get(response.request()); if (item) Object.assign(item, { status: response.status(), responseHeaders: safeHeaders(response.headers()), fromCache: response.fromCache() }); };
+		const onResponse = (response: any) => {
+			const item = requestsByUrl.get(response.request());
+			if (item) Object.assign(item, { status: response.status(), ...(includeHeaders ? { responseHeaders: safeHeaders(response.headers()) } : {}), fromCache: response.fromCache() });
+		};
 		const onRequestFailed = (request: any) => { const item = requestsByUrl.get(request); if (item) item.failure = request.failure()?.errorText ?? "Request failed"; };
 		const onConsole = (message: any) => consoles.push({ type: message.type(), text: message.text().slice(0, 4000), location: message.location() });
 		const onPageError = (error: Error) => errors.push({ message: error.message.slice(0, 4000) });
@@ -635,11 +966,17 @@ export class BrowserSession extends DurableObject<Env> {
 			if (!action) throw Object.assign(new Error("Provide one bounded action to capture, such as {type:'navigate', url} or {type:'reload'}."), { code: "INVALID_INPUT" });
 			if (action.type === "navigate") await page.goto(String(action.url), { waitUntil: action.waitUntil ?? "domcontentloaded", timeout: Number(action.timeoutMs ?? 30_000) });
 			else if (action.type === "reload") await page.reload({ waitUntil: action.waitUntil ?? "domcontentloaded", timeout: Number(action.timeoutMs ?? 30_000) });
-			else if (action.type === "click") await this.performAction(page, { ...action, action: "click" });
-			else if (action.type === "evaluate") await evaluatePage(page, String(action.expression), Number(action.timeoutMs ?? 10_000));
+			else if (action.type === "click") {
+				const outcome = await this.performAction(page, { ...action, action: "click" });
+				if (outcome.structuredContent?.dialogPending) return { structuredContent: { ...outcome.structuredContent, requests, droppedRequests } };
+			}
+			else if (action.type === "evaluate") {
+				const outcome = await evaluatePageWithDialog(page, String(action.expression), Number(action.timeoutMs ?? 10_000));
+				if (outcome.dialogPending) return { structuredContent: { dialogPending: true, dialog: outcome.dialog, page: { tabId: getTabId(page), url: page.url() }, requests, droppedRequests } };
+			}
 			else throw Object.assign(new Error("Capture supports navigate, reload, click, or evaluate actions."), { code: "INVALID_ACTION" });
 			await delay(Math.min(Number(input.settleMs ?? 250), 5000));
-			return { structuredContent: { page: await pageSummary(page), requests: requests.slice(0, 500), ...(debug ? { console: consoles.slice(0, 200), errors: errors.slice(0, 100) } : {}) } };
+			return { structuredContent: { page: await pageSummary(page), requests, requestCount: requests.length, droppedRequests, ...(debug ? { console: consoles.slice(0, 200), errors: errors.slice(0, 100) } : {}) } };
 		} finally {
 			page.off("request", onRequest); page.off("response", onResponse); page.off("requestfailed", onRequestFailed);
 			if (debug) { page.off("console", onConsole); page.off("pageerror", onPageError); }
@@ -651,29 +988,97 @@ export class BrowserSession extends DurableObject<Env> {
 		const maxMs = Math.min(Math.max(Number(input.maxDurationMs ?? MAX_SEQUENCE_MS), 1000), MAX_SEQUENCE_MS);
 		const deadline = Date.now() + maxMs;
 		const outcomes: Json[] = [];
+		let outputChars = 0;
+		let dialogPending = false;
+		let pendingDialog: DialogInfo | undefined;
+		let resolveSequenceDialog!: (value: DialogInfo) => void;
+		const sequenceDialogOpened = new Promise<DialogInfo>((resolve) => { resolveSequenceDialog = resolve; });
+		const watchedPages: Page[] = [];
+		const onPageDialog = (dialog: any) => {
+			pendingDialog = { type: String(dialog.type()), message: String(dialog.message()), ...(dialog.defaultValue() ? { defaultPrompt: String(dialog.defaultValue()) } : {}) };
+			resolveSequenceDialog(pendingDialog);
+		};
+		const watchPage = (candidate: Page) => { candidate.on("dialog", onPageDialog); watchedPages.push(candidate); };
+		const boundedResult = (value: unknown) => {
+			const serialized = JSON.stringify(value ?? null);
+			const remaining = Math.max(0, 80_000 - outputChars);
+			const limit = Math.min(20_000, remaining);
+			if (serialized.length > limit) {
+				outputChars += limit;
+				return { resultPreview: serialized.slice(0, limit), truncated: true };
+			}
+			outputChars += serialized.length;
+			return value ?? null;
+		};
 		let page = initialPage;
+		watchPage(page);
 		for (const [index, step] of input.steps.entries()) {
 			if (Date.now() > deadline) { outcomes.push({ index, error: { code: "SEQUENCE_TIMEOUT", message: "Sequence duration limit reached." } }); break; }
 			try {
-				if (step.type === "navigate") await page.goto(String(step.url), { waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
-				else if (step.type === "reload") await page.reload({ waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
-				else if (step.type === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
-				else if (step.type === "forward") await page.goForward({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
-				else if (step.type === "wait") await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.ms ?? 250), Math.max(deadline - Date.now(), 0))));
-				else if (step.type === "action") await this.performAction(page, step);
-				else if (step.type === "evaluate") await evaluatePage(page, String(step.expression), Math.min(Number(step.timeoutMs ?? 10_000), Math.max(deadline - Date.now(), 1)));
-				else if (step.type === "new_tab") page = await browser.newPage();
+				let stepResult: unknown;
+				if (step.type === "navigate") {
+					const response = await page.goto(String(step.url), { waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+					stepResult = { status: response?.status() ?? null, responseUrl: response?.url() ?? null };
+				} else if (step.type === "reload") {
+					const response = await page.reload({ waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+					stepResult = { status: response?.status() ?? null };
+				} else if (step.type === "back" || step.type === "forward") {
+					const response = step.type === "back"
+						? await page.goBack({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) })
+						: await page.goForward({ waitUntil: "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+					stepResult = { status: response?.status() ?? null, url: page.url() };
+				} else if (step.type === "wait") {
+					const waitedMs = Math.min(Number(step.ms ?? 250), Math.max(deadline - Date.now(), 0));
+					await new Promise((resolve) => setTimeout(resolve, waitedMs));
+					stepResult = { waitedMs };
+				} else if (step.type === "action") {
+					const actionResult = await this.performAction(page, step);
+					stepResult = actionResult.structuredContent ?? actionResult;
+					if (actionResult.structuredContent?.dialogPending) {
+						outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, page: { tabId: getTabId(page), url: page.url() } });
+						dialogPending = true;
+						break;
+					}
+				} else if (step.type === "evaluate") {
+					const evaluation = await evaluatePageWithDialog(page, String(step.expression), Math.min(Number(step.timeoutMs ?? 10_000), Math.max(deadline - Date.now(), 1)));
+					if (evaluation.dialogPending) {
+						stepResult = { dialogPending: true, dialog: evaluation.dialog };
+						outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, page: { tabId: getTabId(page), url: page.url() } });
+						dialogPending = true;
+						break;
+					}
+					stepResult = { result: evaluation.result };
+				} else if (step.type === "new_tab") {
+					page = await browser.newPage();
+					watchPage(page);
+					if (typeof step.url === "string" && step.url) await page.goto(step.url, { waitUntil: step.waitUntil ?? "domcontentloaded", timeout: Math.min(Number(step.timeoutMs ?? 20_000), deadline - Date.now()) });
+					stepResult = { created: true, url: page.url(), tabId: getTabId(page) };
+				}
 				else throw Object.assign(new Error(`Unsupported sequence step type: ${step.type}`), { code: "INVALID_SEQUENCE_STEP" });
-				const state = await pageSummary(page);
+				if (pendingDialog) {
+					outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, dialog: pendingDialog, page: { tabId: getTabId(page), url: page.url() } });
+					dialogPending = true;
+					break;
+				}
+				const pageResult = pageSummary(page).then((value) => ({ kind: "page" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
+				const pageOutcome = await Promise.race([pageResult, sequenceDialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
+				if (pageOutcome.kind === "dialog") {
+					outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, dialog: pageOutcome.dialog, page: { tabId: getTabId(page), url: page.url() } });
+					dialogPending = true;
+					break;
+				}
+				if (pageOutcome.kind === "error") throw pageOutcome.error;
+				const state = pageOutcome.value;
 				if (step.expect) await this.checkExpectation(page, step.expect);
-				outcomes.push({ index, ok: true, page: state });
+				outcomes.push({ index, ok: true, result: boundedResult(stepResult), page: state });
 			} catch (error) {
 				const value = error as { code?: string; message?: string };
-				outcomes.push({ index, ok: false, error: { code: value.code ?? "STEP_FAILED", message: value.message ?? String(error) }, page: await pageSummary(page).catch(() => null) });
+				outcomes.push({ index, ok: false, error: { code: value.code ?? "STEP_FAILED", message: value.message ?? String(error) }, page: { tabId: getTabId(page), url: page.url() } });
 				if (input.stopOnError !== false) break;
 			}
 		}
-		return { structuredContent: { outcomes, tabs: await listTabs(browser), durationMs: maxMs - Math.max(deadline - Date.now(), 0), stopOnError: input.stopOnError !== false } };
+		for (const watchedPage of watchedPages) watchedPage.off("dialog", onPageDialog);
+		return { structuredContent: { outcomes, ...(dialogPending ? { dialogPending: true } : { tabs: await listTabs(browser) }), durationMs: maxMs - Math.max(deadline - Date.now(), 0), stopOnError: input.stopOnError !== false } };
 	}
 
 	private async checkExpectation(page: Page, expect: Json) {
@@ -694,12 +1099,12 @@ export class BrowserSession extends DurableObject<Env> {
 		try {
 			let result: unknown;
 			let liveView: unknown;
-			if (op === "live_view") result = await session.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: input.mode ?? "tab", expiresInMs: Math.min(Number(input.expiresInMs ?? 300_000), 1_800_000) });
+			if (op === "live_view") result = await session.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: input.mode ?? "tab", expiresInMs: Math.min(Math.max(Number(input.expiresInMs ?? 300_000), 60_000), 1_800_000) });
 			else if (op === "handoff") {
 				if (input.url) await page.goto(String(input.url), { waitUntil: "domcontentloaded", timeout: Math.min(Number(input.timeoutMs ?? 300_000), 120_000) });
 				result = await session.send("Cloudflare.handoff", { targetId: getTabId(page), timeout: Math.min(Number(input.timeoutMs ?? 300_000), 1_800_000), instructions: String(input.reason ?? "Please inspect and operate the browser, then complete the handoff.") });
 				const viewSession = await page.createCDPSession();
-				try { liveView = await viewSession.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: "tab", expiresInMs: Math.min(Number(input.timeoutMs ?? 300_000), 300_000) }); }
+				try { liveView = await viewSession.send("Cloudflare.getLiveView", { targetId: getTabId(page), mode: "tab", expiresInMs: Math.min(Math.max(Number(input.timeoutMs ?? 300_000), 60_000), 300_000) }); }
 				catch { liveView = undefined; }
 				finally { await viewSession.detach().catch(() => undefined); }
 			}

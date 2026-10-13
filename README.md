@@ -22,7 +22,9 @@
 
 `browser_snapshot` 返回带 `snapshotId` 的无障碍元素引用，例如 `e4`。调用时同时传入 `ref` 和相同的 `snapshotId`；页面变化后应重新取快照。遇到多个匹配项时，工具会返回 `AMBIGUOUS_TARGET` 和候选引用，不会猜着点击。
 
-工具通过 MCP `structuredContent` 返回页面元数据和 `durationMs`；错误结果带有稳定错误码、建议及可用的候选元素。截图作为 MCP image 内容返回。`browser_sequence` 将最多 30 步合并到一次 DO 调用和 CDP 连接中，最长 60 秒，失败时返回已执行步骤及页面状态。它不是事务，不会自动重放有副作用的动作。
+工具通过 MCP `structuredContent` 返回页面元数据和 `durationMs`；错误结果带有稳定错误码、建议及可用的候选元素。截图作为 MCP image 内容返回。`browser_sequence` 将最多 30 步合并到一次 DO 调用和 CDP 连接中，最长 60 秒，并为每一步返回结构化结果。它不是事务，不会自动重放有副作用的动作。每步输出最多 20,000 字符，整组结果最多 80,000 字符。
+
+JavaScript 原生弹窗会在操作结果中返回 `dialogPending`、弹窗类型和内容。此时应调用 `browser_handle_dialog` 选择接受或关闭；该工具会绕过普通操作队列，以便解除当前被挂起的页面操作。Live View 的有效期最短为 60 秒。网络调试工具支持按资源类型、URL、响应头和请求数量筛选。
 
 ## 架构与成本
 
@@ -31,8 +33,8 @@
 - 每个 OAuth grant 有一个 Durable Object。授权时生成随机 grant 属性，通过 `SESSION_ID_SECRET` 做 HMAC 派生 DO 名称；DO 名称和 Browser Run session ID 不会返回给 MCP 客户端。不要随意轮换 `SESSION_ID_SECRET`，否则现有 grant 将无法找到之前的 DO 状态。
 - DO 只在浏览器会话启动、结束或过期时更新 session ID。它没有轮询、定时 alarm 或后台心跳。
 - Browser Run 首次需要页面时才启动，CDP 命令结束后立即断开。60 秒无活动后，Browser Run 可以结束远端 Chromium。
-- 页面状态会在改变页面的操作后检查。只有 cookie、localStorage、HTTP(S) 标签页 URL 或视口确实变化时，才把一条状态记录写入 DO。Browser Run 结束后，下次需要浏览器的操作会恢复 cookies、localStorage、标签页 URL 和视口。
-- 浏览器数据不按 agent 隔离。同一 OAuth grant 下的 agent 可以使用同一个会话；它们应各自使用 `browser_new_tab` 创建的 `tabId`。DO 会顺序执行同一会话的 MCP 操作，避免并发 CDP 命令互相干扰。
+- 页面状态会在改变页面的操作后检查。只有 cookie、localStorage、HTTP(S) 标签页 URL 或视口确实变化时，才把一条状态记录写入 DO。Browser Run 结束后，下次需要浏览器的操作会恢复 cookies、localStorage、标签页 URL 和视口配置，包括移动设备模拟。
+- 浏览器数据不按 agent 隔离。同一 OAuth grant 下的 agent 可以使用同一个会话；它们应各自使用 `browser_new_tab` 创建的 `tabId`。DO 会顺序执行同一会话的 MCP 操作；`browser_handle_dialog` 可以并行发送以解除原生弹窗造成的挂起。浏览器重启后目标 ID 会变化，恢复结果包含 `previousTabId` 到新 `tabId` 的映射。
 
 恢复的是可持久化的浏览状态。页面中的 JavaScript 内存、DOM 临时状态、`sessionStorage`、IndexedDB、Service Worker 状态及正在进行的下载不会跨 Chromium 结束恢复。文件上传、下载和 PDF 文件传输不在当前版本中。
 
@@ -92,9 +94,9 @@
 
 向 agent 提供以下工作方式：
 
-1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
+1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。`tabs: null` 表示没有查询实时标签页；调用 `browser_list_tabs` 获取当前目标。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
 2. 首次使用时用 `browser_navigate` 打开页面，或用 `browser_new_tab` 创建独立标签页。
-3. 保存并复用当前运行期返回的 `tabId`，每次操作都显式传入，避免多个 agent 误操作同一个标签页。Chromium 重启后 tabId 会变化，恢复后重新列出标签页。
+3. 保存并复用当前运行期返回的 `tabId`，每次操作都显式传入，避免多个 agent 误操作同一个标签页。Chromium 重启后使用 `browser_resume` 返回的 `tabIdMappings` 更新旧 ID。
 4. 用 `browser_snapshot` 或 `browser_find` 获取当前页面的角色、名称和引用，再执行操作。导航或页面大幅变化后重新取快照。
 5. 优先用 `browser_fill_form` 或 `browser_sequence` 合并相关操作，减少 MCP/DO 往返。遇到未知 UI 时先截图或快照，不要盲目点击。
 6. `browser_evaluate` 和 `browser_cdp` 能在已授权浏览器里执行任意页面操作；只对可信的 MCP 服务和 agent 发放授权。

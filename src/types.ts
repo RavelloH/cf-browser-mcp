@@ -30,4 +30,7 @@ export interface SessionResult {
 	persistenceWarning?: string;
 	snapshotId?: string;
 	matches?: unknown[];
+	tabIdMappings?: Array<{ previousTabId: string; tabId: string; url: string }>;
+	dialogPending?: boolean;
+	dialog?: { type: string; message: string; defaultPrompt?: string };
 }
