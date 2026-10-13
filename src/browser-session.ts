@@ -935,14 +935,14 @@ export class BrowserSession extends DurableObject<Env> {
 		const consoles: Json[] = [];
 		const errors: Json[] = [];
 		const filters = (input.filters ?? {}) as Json;
-		const resourceTypes = Array.isArray(filters.resourceTypes) ? new Set(filters.resourceTypes.map(String)) : undefined;
+		const resourceTypes = Array.isArray(filters.resourceTypes) ? new Set(filters.resourceTypes.map((value: unknown) => String(value).toLowerCase())) : undefined;
 		const urlContains = String(filters.urlContains ?? "");
 		const includeHeaders = filters.includeHeaders !== false;
 		const maxRequests = Math.min(Math.max(Number(filters.maxRequests ?? 100), 1), 500);
 		let droppedRequests = 0;
 		const requestsByUrl = new Map<any, Json>();
 		const onRequest = (request: any) => {
-			if ((resourceTypes && !resourceTypes.has(request.resourceType())) || (urlContains && !request.url().includes(urlContains))) return;
+			if ((resourceTypes && !resourceTypes.has(request.resourceType().toLowerCase())) || (urlContains && !request.url().includes(urlContains))) return;
 			if (requests.length >= maxRequests) { droppedRequests++; return; }
 			const item: Json = { url: request.url(), method: request.method(), resourceType: request.resourceType() };
 			if (includeHeaders) item.requestHeaders = safeHeaders(request.headers());
