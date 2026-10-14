@@ -582,7 +582,8 @@ export class BrowserSession extends DurableObject<Env> {
 	}
 
 	private async closeSessionOutOfBand(requestId: string, requestStartedAt: number): Promise<Response> {
-		if (this.closeBarrier) await withTimeout(this.closeBarrier, 45_000, "Waiting for the previous session close");
+		try { if (this.closeBarrier) await withTimeout(this.closeBarrier, 45_000, "Waiting for the previous session close"); }
+		catch (error) { return jsonResponse({ isError: true, requestId, code: "BROWSER_CLOSE_PENDING", message: String((error as Error)?.message ?? error), durationMs: Date.now() - requestStartedAt }); }
 		const previousOperation = this.activeOperation;
 		const sessionId = await this.storedSessionId().catch(() => undefined) ?? this.pendingDialogSessionId;
 		this.lockEpoch++;
@@ -618,7 +619,10 @@ export class BrowserSession extends DurableObject<Env> {
 				persistenceWarning = `The latest state was not snapshotted because ${previousOperation.op} was still running; the previous saved state was preserved.`;
 			}
 
-			if (!sessionId) return jsonResponse({ structuredContent: { closed: false, closeRequested: false, persistenceWarning }, requestId, durationMs: Date.now() - requestStartedAt });
+			if (!sessionId) {
+				const durationMs = Date.now() - requestStartedAt;
+				return jsonResponse({ structuredContent: { closed: false, closeRequested: false, persistenceWarning, requestId, durationMs }, requestId, durationMs });
+			}
 			const close = await this.closeBrowserRunSession(sessionId);
 			if (close.closed) {
 				await this.ctx.storage.delete(["browserSessionId", "browserClosePending", "browserConnectionFailure"]);
@@ -626,7 +630,8 @@ export class BrowserSession extends DurableObject<Env> {
 			} else {
 				await this.ctx.storage.put("browserClosePending", { sessionId, requestId, startedAt: Date.now() } satisfies BrowserClosePending);
 			}
-			return jsonResponse({ structuredContent: { closed: close.closed, closeRequested: true, closeStatus: close.status, ...(persistenceWarning ? { persistenceWarning } : {}), ...(close.warning ? { closeWarning: close.warning } : {}) }, requestId, durationMs: Date.now() - requestStartedAt });
+			const durationMs = Date.now() - requestStartedAt;
+			return jsonResponse({ structuredContent: { closed: close.closed, closeRequested: true, closeStatus: close.status, ...(persistenceWarning ? { persistenceWarning } : {}), ...(close.warning ? { closeWarning: close.warning } : {}), requestId, durationMs }, requestId, durationMs });
 		} catch (error) {
 			const value = error as { message?: string };
 			return jsonResponse({ isError: true, requestId, code: "BROWSER_CLOSE_FAILED", message: value.message ?? String(error), durationMs: Date.now() - requestStartedAt });
@@ -640,7 +645,8 @@ export class BrowserSession extends DurableObject<Env> {
 	}
 
 	private async clearSavedStateOutOfBand(requestId: string, requestStartedAt: number): Promise<Response> {
-		if (this.closeBarrier) await withTimeout(this.closeBarrier, 45_000, "Waiting for the previous session close");
+		try { if (this.closeBarrier) await withTimeout(this.closeBarrier, 45_000, "Waiting for the previous session close"); }
+		catch (error) { return jsonResponse({ isError: true, requestId, code: "BROWSER_CLOSE_PENDING", message: String((error as Error)?.message ?? error), durationMs: Date.now() - requestStartedAt }); }
 		const sessionId = await this.storedSessionId().catch(() => undefined) ?? this.pendingDialogSessionId;
 		this.lockEpoch++;
 		const clearEpoch = this.lockEpoch;
@@ -665,7 +671,8 @@ export class BrowserSession extends DurableObject<Env> {
 				await this.ctx.storage.delete(["browserSessionId", "browserClosePending"]);
 			}
 			this.lastCdpCheck = undefined;
-			return jsonResponse({ structuredContent: { cleared: true, browserClosed: close.closed, closeRequested: Boolean(sessionId), ...(close.warning ? { closeWarning: close.warning } : {}) }, requestId, durationMs: Date.now() - requestStartedAt });
+			const durationMs = Date.now() - requestStartedAt;
+			return jsonResponse({ structuredContent: { cleared: true, browserClosed: close.closed, closeRequested: Boolean(sessionId), ...(close.warning ? { closeWarning: close.warning } : {}), requestId, durationMs }, requestId, durationMs });
 		} catch (error) {
 			const value = error as { message?: string };
 			return jsonResponse({ isError: true, requestId, code: "BROWSER_CLEAR_FAILED", message: value.message ?? String(error), durationMs: Date.now() - requestStartedAt });
@@ -1130,11 +1137,12 @@ export class BrowserSession extends DurableObject<Env> {
 		if (op === "snapshot") return { structuredContent: await snapshot(page, input) };
 		if (op === "find") {
 			const result = await snapshot(page, { maxNodes: 1000, maxChars: 500 });
+			const exact = input.exact !== false;
 			const nodes = (result.nodes as Json[]).filter((node) => {
 				const roleMatch = !input.role || node.role === input.role;
 				const query = String(input.query ?? input.name ?? "").toLocaleLowerCase();
 				const name = String(node.name ?? "").toLocaleLowerCase();
-				return roleMatch && (!query || (input.exact ? name === query : name.includes(query)));
+				return roleMatch && (!query || (exact ? name === query : name.includes(query)));
 			}).slice(0, Math.min(Number(input.limit ?? 50), 100));
 			return { structuredContent: { tabId: result.tabId, url: result.url, snapshotId: result.snapshotId, matches: nodes } };
 		}
