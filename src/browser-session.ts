@@ -484,33 +484,6 @@ export class BrowserSession extends DurableObject<Env> {
 		await this.saveStateRecord({ ...state, tabs });
 	}
 
-	private async applySavedViewports(browser: Browser): Promise<void> {
-		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-		if (!state) return;
-		const viewports = new Map(state.tabs.filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
-		for (const page of await browser.pages()) {
-			const viewport = viewports.get(getTabId(page));
-			if (viewport) await applyViewport(page, {
-				width: Number(viewport.width ?? 800),
-				height: Number(viewport.height ?? 600),
-				deviceScaleFactor: Number(viewport.deviceScaleFactor ?? 1),
-				mobile: Boolean(viewport.mobile),
-			});
-		}
-	}
-
-	private async applySavedViewport(browser: Browser, tabId?: string): Promise<void> {
-		const page = await pickPage(browser, tabId, false);
-		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-		const viewport = state?.tabs.find((tab) => tab.tabId === getTabId(page))?.viewport;
-		if (viewport) await applyViewport(page, {
-			width: Number(viewport.width ?? 800),
-			height: Number(viewport.height ?? 600),
-			deviceScaleFactor: Number(viewport.deviceScaleFactor ?? 1),
-			mobile: Boolean(viewport.mobile),
-		});
-	}
-
 	private async reconcileTabIds(browser: Browser): Promise<Array<{ previousTabId: string; tabId: string; url: string }>> {
 		const record = await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord");
 		const state = record?.state;
@@ -617,7 +590,6 @@ export class BrowserSession extends DurableObject<Env> {
 		}
 		if (op === "resume") {
 			try {
-				await this.applySavedViewports(browser);
 				return { structuredContent: { active: true, restored: connection.created, tabs: await listTabs(browser), ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
 			}
 			finally { browser.disconnect(); }
@@ -625,8 +597,6 @@ export class BrowserSession extends DurableObject<Env> {
 		let result: SessionResult | undefined;
 		let operationError: unknown;
 		try {
-			if (op === "list_tabs") await this.applySavedViewports(browser);
-			else if (op !== "new_tab" && op !== "close_tab") await this.applySavedViewport(browser, operationInput.tabId ? String(operationInput.tabId) : undefined);
 			result = await this.runOperation(browser, op, operationInput);
 			if (connection.tabIdMappings?.length && result.structuredContent) result.structuredContent = { ...result.structuredContent, tabIdMappings: connection.tabIdMappings };
 		} catch (error) {
