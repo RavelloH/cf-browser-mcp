@@ -80,6 +80,16 @@ type PersistedBrowserState = {
 };
 const MUTATING_OPS = new Set(["new_tab", "close_tab", "navigate", "back", "forward", "reload", "wait", "action", "fill_form", "handle_dialog", "evaluate", "viewport", "mouse", "keyboard", "sequence", "network_requests", "debug_capture", "cdp", "handoff", "handoff_status", "handoff_complete"]);
 
+function normalizeViewport(viewport: Partial<PersistedViewport> | null | undefined): PersistedViewport {
+	const positiveNumber = (value: number | undefined, fallback: number) => Number.isFinite(value) && Number(value) > 0 ? Number(value) : fallback;
+	return {
+		width: positiveNumber(viewport?.width, 800),
+		height: positiveNumber(viewport?.height, 600),
+		deviceScaleFactor: positiveNumber(viewport?.deviceScaleFactor, 1),
+		mobile: typeof viewport?.mobile === "boolean" ? viewport.mobile : false,
+	};
+}
+
 function jsonResponse(value: unknown, status = 200): Response {
 	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
@@ -136,14 +146,15 @@ async function applyViewport(page: Page, viewport: PersistedViewport): Promise<v
 	// state. Use the Page's primary CDP session to restore emulation without a
 	// navigation or reload.
 	const session = (page as any)._client() as CDPSession;
+	const normalized = normalizeViewport(viewport);
 	await (session as any).send("Emulation.setDeviceMetricsOverride", {
-		width: viewport.width,
-		height: viewport.height,
-		deviceScaleFactor: viewport.deviceScaleFactor,
-		mobile: viewport.mobile,
+		width: normalized.width,
+		height: normalized.height,
+		deviceScaleFactor: normalized.deviceScaleFactor,
+		mobile: normalized.mobile,
 		screenOrientation: { angle: 0, type: "portraitPrimary" },
 	}, { timeout: CDP_COMMAND_TIMEOUT_MS });
-	await (session as any).send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile }, { timeout: CDP_COMMAND_TIMEOUT_MS });
+	await (session as any).send("Emulation.setTouchEmulationEnabled", { enabled: normalized.mobile }, { timeout: CDP_COMMAND_TIMEOUT_MS });
 }
 
 function getTabId(page: Page): string {
@@ -355,6 +366,18 @@ export class BrowserSession extends DurableObject<Env> {
 				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
 			}
 		}
+		// This recovery operation only edits saved tab metadata and remains
+		// available when Chromium restoration or the normal session queue fails.
+		if (input.op === "forget_saved_tab") {
+			try {
+				const result = await this.forgetSavedTab(input.input ?? {});
+				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				return jsonResponse(result);
+			} catch (error) {
+				const value = error as { code?: string; message?: string };
+				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
+			}
+		}
 		// This operation only reads Durable Object storage and Browser Run session
 		// metadata. Keep it available even if a page operation is stuck on CDP.
 		if (input.op === "status") {
@@ -460,7 +483,29 @@ export class BrowserSession extends DurableObject<Env> {
 
 	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
 
+	private async forgetSavedTab(input: Record<string, unknown>): Promise<SessionResult> {
+		const previousTabId = typeof input.previousTabId === "string" ? input.previousTabId.trim() : "";
+		if (!previousTabId) throw Object.assign(new Error("previousTabId is required."), { code: "INVALID_INPUT" });
+
+		const status = await browserStatus(this.env, await this.storedSessionId());
+		if (status.active !== false) {
+			throw Object.assign(new Error("Saved tabs can only be forgotten while the Browser Run session is inactive."), { code: status.active === true ? "BROWSER_SESSION_ACTIVE" : "BROWSER_SESSION_STATUS_UNKNOWN" });
+		}
+
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state?.tabs?.some((tab) => tab.tabId === previousTabId)) {
+			throw Object.assign(new Error(`Saved tab ${previousTabId} was not found.`), { code: "SAVED_TAB_NOT_FOUND" });
+		}
+		const tabs = state.tabs.filter((tab) => tab.tabId !== previousTabId);
+		await this.saveStateRecord({ ...state, tabs });
+		return { structuredContent: { forgotten: true, previousTabId, remainingRestorableTabs: tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).length, cookiesPreserved: true, localStoragePreserved: true } };
+	}
+
 	private async saveStateRecord(state: PersistedBrowserState): Promise<void> {
+		state = {
+			...state,
+			tabs: state.tabs.map((tab) => ({ ...tab, viewport: tab.viewport ? normalizeViewport(tab.viewport) : null })),
+		};
 		let serialized = JSON.stringify(state);
 		if (new TextEncoder().encode(serialized).byteLength > 1_500_000) {
 			state = { ...state, localStorage: {}, tabs: state.tabs.slice(0, 15) };

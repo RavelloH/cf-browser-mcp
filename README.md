@@ -10,7 +10,7 @@
 
 | 类别 | MCP 工具 |
 | --- | --- |
-| 会话与标签页 | `browser_status`、`browser_resume`、`browser_list_tabs`、`browser_new_tab`、`browser_activate_tab`、`browser_close_tab`、`browser_close_session`、`browser_clear_saved_state` |
+| 会话与标签页 | `browser_status`、`browser_resume`、`browser_forget_saved_tab`、`browser_list_tabs`、`browser_new_tab`、`browser_activate_tab`、`browser_close_tab`、`browser_close_session`、`browser_clear_saved_state` |
 | 导航与等待 | `browser_navigate`、`browser_back`、`browser_forward`、`browser_reload`、`browser_wait`、`browser_page_info` |
 | 页面理解 | `browser_snapshot`、`browser_find` |
 | 鼠标、键盘与表单 | `browser_click`、`browser_hover`、`browser_mouse`、`browser_scroll`、`browser_keyboard`、`browser_type`、`browser_fill`、`browser_press_key`、`browser_select_option`、`browser_check`、`browser_uncheck`、`browser_focus`、`browser_scroll_into_view`、`browser_fill_form`、`browser_handle_dialog` |
@@ -102,6 +102,7 @@ JavaScript 原生弹窗会在操作结果中返回 `dialogPending`、弹窗类�
 6. `browser_evaluate` 和 `browser_cdp` 能在已授权浏览器里执行任意页面操作；只对可信的 MCP 服务和 agent 发放授权。
 7. 如需人工查看，调用 `browser_live_view`；如需人工操作，调用 `browser_request_human`，完成后检查状态并调用 `browser_handoff_complete`。Live View URL 是短时 bearer 链接，拿到链接的人可以查看该浏览器。
 8. `browser_close_session` 会关闭当前 Chromium，但保留可恢复的浏览状态；要删除已保存的 cookies 和站点数据，调用 `browser_clear_saved_state`。
+9. 如果 `browser_resume` 无法恢复某个损坏标签页，先用 `browser_status` 找到它的 `previousTabId`，确认会话不活跃后调用 `browser_forget_saved_tab`。它只删除该标签页的恢复记录，不启动 Chromium，也保留 cookies 和全部 localStorage。
 
 OAuth access token 默认有效 1 小时，refresh token 最长 90 天并在活动时延长空闲期限。授权密钥失败会按来源 IP 限制尝试次数。丢失密钥后，可在 Cloudflare Workers 设置中更换 secret；已经签发的 OAuth grant 仍需要通过客户端 revoke 或重新授权管理。
 

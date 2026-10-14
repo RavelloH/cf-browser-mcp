@@ -81,6 +81,7 @@ export function createBrowserMcpServer(env: Env, props: Record<string, unknown>)
 
 	register("browser_status", "Show whether this OAuth grant has an active Cloudflare Browser session and which saved tabs can be restored. tabs is null when live tabs were not queried; use browser_list_tabs for the current targets.", {}, "status");
 	register("browser_resume", "Start Chromium and restore saved cookies, localStorage, and tabs when the remote session is idle. Returns current tab IDs and previousTabId-to-tabId mappings when Chromium was restored.", {}, "resume");
+	register("browser_forget_saved_tab", "Remove one failed or unwanted restorable tab record by previousTabId without starting or closing Chromium. The session must be inactive; cookies and all localStorage are preserved.", { previousTabId: z.string().min(1).describe("The previousTabId shown by browser_status.restorableTabs.") }, "forget_saved_tab");
 	register("browser_list_tabs", "List open tabs with tabId, URL, title, and viewport. Does not start a browser.", {}, "list_tabs");
 	register("browser_new_tab", "Open a new tab, optionally navigating to a URL.", { url: z.string().url().optional(), waitUntil: z.enum(["load", "domcontentloaded", "networkidle0", "networkidle2"]).optional(), timeoutMs: z.number().int().min(1000).max(120000).optional() }, "new_tab");
 	register("browser_activate_tab", "Bring the selected tab to the front. Does not start Chromium if the tab is not active.", tab, "activate_tab");
