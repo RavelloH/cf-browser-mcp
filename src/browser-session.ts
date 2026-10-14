@@ -176,7 +176,7 @@ async function pageSummary(page: Page): Promise<Json> {
 }
 
 async function listTabs(browser: Browser): Promise<Json[]> {
-	const pages = await browser.pages();
+	const pages = await withTimeout(browser.pages(), CDP_COMMAND_TIMEOUT_MS, "Listing browser tabs");
 	return Promise.all(pages.map(pageSummary));
 }
 
@@ -672,16 +672,6 @@ export class BrowserSession extends DurableObject<Env> {
 		if (saved) await applyViewport(page, saved);
 	}
 
-	private async applySavedViewports(browser: Browser): Promise<void> {
-		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-		if (!state?.tabs.length) return;
-		const viewportByTabId = new Map(state.tabs.filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
-		for (const page of await browser.pages()) {
-			const saved = viewportByTabId.get(getTabId(page));
-			if (saved) await applyViewport(page, saved);
-		}
-	}
-
 	private async reconcileTabIds(browser: Browser): Promise<Array<{ previousTabId: string; tabId: string; url: string }>> {
 		const record = await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord");
 		const state = record?.state;
@@ -816,8 +806,7 @@ export class BrowserSession extends DurableObject<Env> {
 			const remapped = connection.tabIdMappings?.find((mapping) => mapping.previousTabId === input.tabId);
 			if (remapped) operationInput = { ...input, tabId: remapped.tabId };
 		}
-		if (op === "resume" || op === "list_tabs") await this.applySavedViewports(browser);
-		else if (op !== "new_tab" && op !== "close_tab") {
+		if (op !== "resume" && op !== "list_tabs" && op !== "new_tab" && op !== "close_tab") {
 			await this.applySavedViewport(browser, typeof operationInput.tabId === "string" ? operationInput.tabId : undefined);
 		}
 		if (op === "resume") {
