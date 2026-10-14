@@ -546,7 +546,10 @@ export class BrowserSession extends DurableObject<Env> {
 	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
 
 	private browserEndpoint(connection: { webSocket: Fetcher }) {
-		return { fetch: (input: RequestInfo | URL, init?: RequestInit) => connection.webSocket.fetch(input, init) };
+		// Browser Run's session-pinned Fetcher opens CDP at this documented URL.
+		// Puppeteer's Workers transport supplies its own fake.host path, which is
+		// intended for the unpinned BROWSER binding and must not be forwarded here.
+		return { fetch: (_input: RequestInfo | URL, init?: RequestInit) => connection.webSocket.fetch("https://browser-binding.invalid", init) };
 	}
 
 	private async connectToBrowserSession(sessionId: string) {
