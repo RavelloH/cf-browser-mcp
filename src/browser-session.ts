@@ -727,7 +727,7 @@ export class BrowserSession extends DurableObject<Env> {
 				persistenceWarning = `The latest state was not snapshotted because ${previousOperation.op} was still running; the previous saved state was preserved.`;
 			}
 			const cached = this.cachedBrowserConnection;
-			if (sessionId && cached?.sessionId === sessionId) await this.disconnectBrowser(cached.browser);
+			if (cached && (!sessionId || cached.sessionId === sessionId)) await this.disconnectBrowser(cached.browser);
 
 			if (!sessionId) {
 				const durationMs = Date.now() - requestStartedAt;
@@ -773,7 +773,7 @@ export class BrowserSession extends DurableObject<Env> {
 		try {
 			if (this.pendingDialogBrowser) await this.closePendingDialogBrowser();
 			const cached = this.cachedBrowserConnection;
-			if (sessionId && cached?.sessionId === sessionId) await this.disconnectBrowser(cached.browser);
+			if (cached && (!sessionId || cached.sessionId === sessionId)) await this.disconnectBrowser(cached.browser);
 			const close = sessionId ? await this.closeBrowserRunSession(sessionId) : { closed: false, status: "unknown" as const };
 			await this.ctx.storage.delete(["browserStateRecord", "browserConnectionFailure"]);
 			if (sessionId && !close.closed) {
@@ -1188,7 +1188,7 @@ export class BrowserSession extends DurableObject<Env> {
 				assertCurrentEpoch();
 				return { structuredContent: { active: true, restored: connection.created, tabs, ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
 			} catch (error) {
-				if (["CDP_COMMAND_TIMEOUT", "BROWSER_SESSION_LOST"].includes((error as { code?: string })?.code ?? this.errorCode(error))) {
+				if (["CDP_COMMAND_TIMEOUT", "BROWSER_SESSION_LOST"].includes(this.errorCode(error))) {
 					console.error("Browser Run CDP resume failed", { requestId: this.activeOperation?.requestId, op, sessionTag: connection.sessionId?.slice(-8), message: String((error as Error)?.message ?? error).slice(0, 300) });
 					await this.disconnectBrowser(browser);
 				}
@@ -1203,7 +1203,7 @@ export class BrowserSession extends DurableObject<Env> {
 			if (connection.tabIdMappings?.length && result.structuredContent) result.structuredContent = { ...result.structuredContent, tabIdMappings: connection.tabIdMappings };
 		} catch (error) {
 			operationError = error;
-			const errorCode = (error as { code?: string })?.code ?? this.errorCode(error);
+			const errorCode = this.errorCode(error);
 			if (["CDP_COMMAND_TIMEOUT", "BROWSER_SESSION_LOST"].includes(errorCode)) {
 				console.error("Browser Run CDP operation failed", {
 					requestId: this.activeOperation?.requestId,
