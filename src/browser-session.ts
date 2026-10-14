@@ -111,6 +111,17 @@ async function evaluatePageWithDialog(page: Page, expression: string, timeoutMs 
 }
 
 async function applyViewport(page: Page, viewport: PersistedViewport): Promise<void> {
+	const current = await page.evaluate(() => ({
+		width: innerWidth,
+		height: innerHeight,
+		deviceScaleFactor: devicePixelRatio,
+		hasTouch: navigator.maxTouchPoints > 0,
+	})).catch(() => null);
+	if (current
+		&& current.width === viewport.width
+		&& current.height === viewport.height
+		&& Math.abs(current.deviceScaleFactor - viewport.deviceScaleFactor) < 0.01
+		&& current.hasTouch === viewport.mobile) return;
 	await page.setViewport({
 		width: viewport.width,
 		height: viewport.height,
