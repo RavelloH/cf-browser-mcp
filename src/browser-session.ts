@@ -552,11 +552,16 @@ export class BrowserSession extends DurableObject<Env> {
 		// Puppeteer's Workers transport supplies its own fake.host path, which is
 		// intended for the unpinned BROWSER binding and must not be forwarded here.
 		let socket: WebSocket | undefined;
+		let canceled = false;
 		return {
 			get socket() { return socket; },
+			cancel: () => { canceled = true; },
 			fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
 				const response = await connection.webSocket.fetch("https://browser-binding.invalid", init);
-				if (response.webSocket) socket = response.webSocket;
+				if (response.webSocket) {
+					socket = response.webSocket;
+					if (canceled) await this.closeCdpSocket(socket);
+				}
 				return response;
 			},
 		};
@@ -607,6 +612,7 @@ export class BrowserSession extends DurableObject<Env> {
 			this.browserSockets.set(browser, endpoint.socket);
 			return browser;
 		} catch (error) {
+			endpoint.cancel();
 			if (browser) await this.disconnectBrowser(browser);
 			else await this.closeCdpSocket(endpoint.socket);
 			throw error;
