@@ -8,8 +8,24 @@ const MAX_TEXT = 80_000;
 const MAX_CDP_BYTES = 250_000;
 const MAX_SEQUENCE_STEPS = 30;
 const MAX_SEQUENCE_MS = 60_000;
+const STATE_READ_TIMEOUT_MS = 2_500;
+const CDP_COMMAND_TIMEOUT_MS = 5_000;
 
 function delay(ms: number) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<T>((_, reject) => {
+				timer = setTimeout(() => reject(Object.assign(new Error(`${label} timed out after ${timeoutMs} ms.`), { code: "CDP_COMMAND_TIMEOUT" })), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 function keyCode(key: string): string {
 	if (/^[a-z]$/i.test(key)) return `Key${key.toUpperCase()}`;
@@ -120,14 +136,14 @@ async function applyViewport(page: Page, viewport: PersistedViewport): Promise<v
 	// state. Use the Page's primary CDP session to restore emulation without a
 	// navigation or reload.
 	const session = (page as any)._client() as CDPSession;
-	await session.send("Emulation.setDeviceMetricsOverride", {
+	await (session as any).send("Emulation.setDeviceMetricsOverride", {
 		width: viewport.width,
 		height: viewport.height,
 		deviceScaleFactor: viewport.deviceScaleFactor,
 		mobile: viewport.mobile,
 		screenOrientation: { angle: 0, type: "portraitPrimary" },
-	});
-	await session.send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile });
+	}, { timeout: CDP_COMMAND_TIMEOUT_MS });
+	await (session as any).send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile }, { timeout: CDP_COMMAND_TIMEOUT_MS });
 }
 
 function getTabId(page: Page): string {
@@ -136,11 +152,15 @@ function getTabId(page: Page): string {
 }
 
 async function pageSummary(page: Page): Promise<Json> {
+	const [title, viewport] = await Promise.all([
+		withTimeout(page.title(), STATE_READ_TIMEOUT_MS, "Reading page title").catch(() => ""),
+		withTimeout(page.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })), STATE_READ_TIMEOUT_MS, "Reading page viewport").catch(() => null),
+	]);
 	return {
 		tabId: getTabId(page),
 		url: page.url(),
-		title: await page.title().catch(() => ""),
-		viewport: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio })).catch(() => null),
+		title,
+		viewport,
 	};
 }
 
@@ -298,7 +318,7 @@ async function snapshot(page: Page, input: Json) {
 async function browserStatus(env: Env, sessionId: string | undefined) {
 	if (!sessionId) return { active: false, browserSessionId: null, tabs: null, tabsKnown: false };
 	try {
-		const sessions = await puppeteer.sessions(env.BROWSER as any);
+		const sessions = await withTimeout(puppeteer.sessions(env.BROWSER as any), CDP_COMMAND_TIMEOUT_MS, "Checking Browser Run sessions");
 		return { active: sessions.some((session) => session.sessionId === sessionId), browserSessionId: undefined, tabs: null, tabsKnown: false };
 	} catch {
 		return { active: null, browserSessionId: undefined, tabs: null, tabsKnown: false, error: "Could not query Browser Run session metadata." };
@@ -333,6 +353,18 @@ export class BrowserSession extends DurableObject<Env> {
 			} catch (error) {
 				const value = error as { code?: string; message?: string; [key: string]: unknown };
 				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
+			}
+		}
+		// This operation only reads Durable Object storage and Browser Run session
+		// metadata. Keep it available even if a page operation is stuck on CDP.
+		if (input.op === "status") {
+			try {
+				const result = await this.dispatch(input);
+				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				return jsonResponse(result);
+			} catch (error) {
+				const value = error as { code?: string; message?: string };
+				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
 			}
 		}
 		const previous = this.lock;
@@ -491,37 +523,64 @@ export class BrowserSession extends DurableObject<Env> {
 	}
 
 	private async persistState(browser: Browser): Promise<void> {
-		const pages = await browser.pages();
-		const anchor = pages[0] ?? await browser.newPage();
+		const pages = await withTimeout(browser.pages(), CDP_COMMAND_TIMEOUT_MS, "Listing browser pages for persistence");
+		const anchor = pages[0] ?? await withTimeout(browser.newPage(), CDP_COMMAND_TIMEOUT_MS, "Opening persistence page");
 		const temporaryAnchor = pages.length === 0;
-		const cookieSession = await anchor.createCDPSession();
-		let cookies: Json[] = [];
+		const previousState = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		let cookies: Json[] = previousState?.cookies ?? [];
 		try {
-			const result = await (cookieSession as any).send("Network.getAllCookies") as { cookies?: Json[] };
+			const cookieSession = await withTimeout(anchor.createCDPSession(), CDP_COMMAND_TIMEOUT_MS, "Opening cookie persistence session");
+			let result: { cookies?: Json[] };
+			try {
+				result = await (cookieSession as any).send("Network.getAllCookies", {}, { timeout: CDP_COMMAND_TIMEOUT_MS }) as { cookies?: Json[] };
+			} finally {
+				await cookieSession.detach().catch(() => undefined);
+			}
 			cookies = (result.cookies ?? []).slice(0, 3000).map((cookie) => {
 				const { session, ...cookieParam } = cookie;
 				if (session || Number(cookieParam.expires) < 0) delete cookieParam.expires;
 				return cookieParam;
 			});
+		} catch (error) {
+			console.warn("Browser state cookie snapshot skipped", { message: String((error as Error)?.message ?? error).slice(0, 300) });
 		} finally {
-			await cookieSession.detach().catch(() => undefined);
-			if (temporaryAnchor) await anchor.close().catch(() => undefined);
+			if (temporaryAnchor) await withTimeout(anchor.close(), CDP_COMMAND_TIMEOUT_MS, "Closing persistence page").catch(() => undefined);
 		}
-		const previousState = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
 		const previousViewports = new Map((previousState?.tabs ?? []).filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
 		const localStorage: Record<string, Record<string, string>> = {};
+		const failedOrigins = new Set<string>();
 		const tabs: PersistedBrowserState["tabs"] = [];
-		for (const page of pages.slice(0, 30)) {
-			const url = page.url();
-			const tabId = getTabId(page);
-			const viewport = previousViewports.get(tabId) ?? null;
-			if (/^https?:\/\//i.test(url) || viewport) tabs.push({ tabId, url, viewport });
-			const values = await page.evaluate(() => {
-				const result: Record<string, string> = {};
-				try { for (let i = 0; i < Math.min(window.localStorage.length, 500); i++) { const key = window.localStorage.key(i); if (key) result[key] = String(window.localStorage.getItem(key) ?? "").slice(0, 10_000); } } catch { /* The page may disable storage. */ }
-				return result;
-			}).catch(() => null);
-			if (values && /^https?:\/\//i.test(url)) localStorage[new URL(url).origin] = values;
+		const pagesToPersist = pages.slice(0, 30);
+		for (let offset = 0; offset < pagesToPersist.length; offset += 5) {
+			const batch = pagesToPersist.slice(offset, offset + 5);
+			const snapshots = await Promise.all(batch.map(async (page) => {
+				const url = page.url();
+				const tabId = getTabId(page);
+				const viewport = previousViewports.get(tabId) ?? null;
+				const values = await withTimeout(page.evaluate(() => {
+					const result: Record<string, string> = {};
+					try { for (let i = 0; i < Math.min(window.localStorage.length, 500); i++) { const key = window.localStorage.key(i); if (key) result[key] = String(window.localStorage.getItem(key) ?? "").slice(0, 10_000); } } catch { /* The page may disable storage. */ }
+					return result;
+				}), STATE_READ_TIMEOUT_MS, "Reading page localStorage").catch((error) => {
+					console.warn("Browser state localStorage snapshot skipped", { tabId, message: String((error as Error)?.message ?? error).slice(0, 300) });
+					return null;
+				});
+				return { tabId, url, viewport, values };
+			}));
+			for (const snapshot of snapshots) {
+				if (/^https?:\/\//i.test(snapshot.url) || snapshot.viewport) tabs.push({ tabId: snapshot.tabId, url: snapshot.url, viewport: snapshot.viewport });
+				if (/^https?:\/\//i.test(snapshot.url)) {
+					const origin = new URL(snapshot.url).origin;
+					if (snapshot.values) {
+						localStorage[origin] = snapshot.values;
+						failedOrigins.delete(origin);
+					} else if (!localStorage[origin]) failedOrigins.add(origin);
+				}
+			}
+		}
+		for (const origin of failedOrigins) {
+			const previousValues = previousState?.localStorage[origin];
+			if (previousValues) localStorage[origin] = previousValues;
 		}
 		const state: PersistedBrowserState = { version: 1, cookies, localStorage, tabs };
 		await this.saveStateRecord(state);
