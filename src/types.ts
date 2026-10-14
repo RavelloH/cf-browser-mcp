@@ -2,7 +2,7 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import type { BrowserSession } from "./browser-session.js";
 
 export interface Env {
-	BROWSER: { fetch: typeof fetch };
+	BROWSER: BrowserRun;
 	BROWSER_SESSION: DurableObjectNamespace<BrowserSession>;
 	OAUTH_KV: KVNamespace;
 	OAUTH_PROVIDER: OAuthHelpers;

@@ -94,14 +94,14 @@ JavaScript 原生弹窗会在操作结果中返回 `dialogPending`、弹窗类�
 
 向 agent 提供以下工作方式：
 
-1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。`sessionOperation` 和 `queuedOperations` 可显示当前正在执行或排队的操作，方便定位卡住的请求。`tabs: null` 表示没有查询实时标签页；调用 `browser_list_tabs` 获取当前目标。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
+1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。`browserRunActive`（兼容字段 `active`）表示 Cloudflare Browser Run 会话是否存在；`cdpStatus` 表示最近一次 CDP 操作的结果，并非实时探测。`sessionOperation` 和 `queuedOperations` 显示正在执行或排队的操作。`tabs: null` 表示没有查询实时标签页；调用 `browser_list_tabs` 获取当前目标。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
 2. 首次使用时用 `browser_navigate` 打开页面，或用 `browser_new_tab` 创建独立标签页。
 3. 保存并复用当前运行期返回的 `tabId`，每次操作都显式传入，避免多个 agent 误操作同一个标签页。Chromium 重启后使用 `browser_resume` 返回的 `tabIdMappings` 更新旧 ID。
 4. 用 `browser_snapshot` 或 `browser_find` 获取当前页面的角色、名称和引用，再执行操作。导航或页面大幅变化后重新取快照。
 5. 优先用 `browser_fill_form` 或 `browser_sequence` 合并相关操作，减少 MCP/DO 往返。遇到未知 UI 时先截图或快照，不要盲目点击。
 6. `browser_evaluate` 和 `browser_cdp` 能在已授权浏览器里执行任意页面操作；只对可信的 MCP 服务和 agent 发放授权。
 7. 如需人工查看，调用 `browser_live_view`；如需人工操作，调用 `browser_request_human`，完成后检查状态并调用 `browser_handoff_complete`。Live View URL 是短时 bearer 链接，拿到链接的人可以查看该浏览器。
-8. `browser_close_session` 会关闭当前 Chromium，但保留可恢复的浏览状态；要删除已保存的 cookies 和站点数据，调用 `browser_clear_saved_state`。
+8. `browser_close_session` 通过 Cloudflare Browser Run 会话接口关闭 Chromium，不依赖 CDP，也不会等待浏览器操作队列；正常情况下会先保存最新浏览状态。如果另一个操作仍卡在 CDP，则会保留上次成功保存的状态，并在结果中说明。Cloudflare 仍在关闭时，结果会带 `closePending`，之后可重试关闭或恢复。要删除已保存的 cookies 和站点数据，调用 `browser_clear_saved_state`。
 9. 如果 `browser_resume` 无法恢复某个损坏标签页，先用 `browser_status` 找到它的 `previousTabId`，确认会话不活跃后调用 `browser_forget_saved_tab`。它只删除该标签页的恢复记录，不启动 Chromium，也保留 cookies 和全部 localStorage。
 
 OAuth access token 默认有效 1 小时，refresh token 最长 90 天并在活动时延长空闲期限。授权密钥失败会按来源 IP 限制尝试次数。丢失密钥后，可在 Cloudflare Workers 设置中更换 secret；已经签发的 OAuth grant 仍需要通过客户端 revoke 或重新授权管理。
