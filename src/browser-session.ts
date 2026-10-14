@@ -365,6 +365,7 @@ export class BrowserSession extends DurableObject<Env> {
 	private lock: Promise<void> = Promise.resolve();
 	private lockEpoch = 0;
 	private readonly browserSockets = new WeakMap<Browser, WebSocket>();
+	private cachedBrowserConnection?: { sessionId: string; browser: Browser; socket: WebSocket; requestId: string };
 	private activeOperation?: { requestId: string; op: string; startedAt: number };
 	private activeOperationEpoch?: number;
 	private activeRelease?: () => void;
@@ -595,6 +596,7 @@ export class BrowserSession extends DurableObject<Env> {
 	private async disconnectBrowser(browser?: Browser): Promise<void> {
 		if (!browser) return;
 		const socket = this.browserSockets.get(browser);
+		if (this.cachedBrowserConnection?.browser === browser) this.cachedBrowserConnection = undefined;
 		const closed = socket ? this.waitForCdpSocketClose(socket) : undefined;
 		try { await browser.disconnect(); } catch { /* The Browser Run socket may already be closed. */ }
 		if (closed && !await closed && socket) {
@@ -603,33 +605,56 @@ export class BrowserSession extends DurableObject<Env> {
 		this.browserSockets.delete(browser);
 	}
 
-	private async connectWithEndpoint(connection: { webSocket: Fetcher }, sessionId: string): Promise<Browser> {
+	private async connectWithEndpoint(connection: { webSocket: Fetcher }, sessionId: string, requestId: string): Promise<Browser> {
 		const endpoint = this.browserEndpoint(connection);
 		let browser: Browser | undefined;
+		const connectStartedAt = Date.now();
+		console.info("Browser Run CDP connection starting", { requestId, sessionTag: sessionId.slice(-8) });
 		try {
 			browser = await withTimeout(puppeteer.connect(endpoint as any, sessionId), CDP_CONNECT_TIMEOUT_MS, "Connecting to Browser Run session");
 			if (!endpoint.socket) throw Object.assign(new Error("Browser Run connected without exposing a CDP WebSocket."), { code: "BROWSER_WEBSOCKET_UNAVAILABLE" });
 			this.browserSockets.set(browser, endpoint.socket);
+			const cached = { sessionId, browser, socket: endpoint.socket, requestId };
+			this.cachedBrowserConnection = cached;
+			endpoint.socket.addEventListener("close", (event) => {
+				if (this.cachedBrowserConnection === cached) this.cachedBrowserConnection = undefined;
+				console.warn("Browser Run CDP WebSocket closed", {
+					requestId,
+					sessionTag: sessionId.slice(-8),
+					code: event.code,
+					reason: String(event.reason ?? "").slice(0, 160),
+					wasClean: event.wasClean,
+				});
+			}, { once: true });
+			console.info("Browser Run CDP connection ready", { requestId, sessionTag: sessionId.slice(-8), durationMs: Date.now() - connectStartedAt, socketState: endpoint.socket.readyState });
 			return browser;
 		} catch (error) {
 			endpoint.cancel();
 			if (browser) await this.disconnectBrowser(browser);
 			else await this.closeCdpSocket(endpoint.socket);
+			console.error("Browser Run CDP connection failed", {
+				requestId,
+				sessionTag: sessionId.slice(-8),
+				durationMs: Date.now() - connectStartedAt,
+				stage: endpoint.socket ? "puppeteer_handshake" : "websocket_upgrade",
+				message: String((error as Error)?.message ?? error).slice(0, 300),
+			});
 			throw error;
 		}
 	}
 
-	private async connectToBrowserSession(sessionId: string) {
+	private async connectToBrowserSession(sessionId: string, requestId: string) {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const connection = await withTimeout(this.env.BROWSER.connectSession(sessionId), BROWSER_API_TIMEOUT_MS, "Creating session-pinned CDP connection");
 			try {
-				return await this.connectWithEndpoint(connection, sessionId);
+				return await this.connectWithEndpoint(connection, sessionId, requestId);
 			} catch (error) {
 				lastError = error;
 				const message = String((error as Error)?.message ?? error);
 				const connectionNotReady = /cannot read properties of null \(reading ['"]accept['"]\)|not ready yet|still in use|BROWSER_WEBSOCKET_UNAVAILABLE/i.test(message);
 				if (!connectionNotReady || attempt === 2) throw error;
+				console.warn("Browser Run CDP reconnect attempt failed", { requestId, sessionTag: sessionId.slice(-8), attempt: attempt + 1, retryable: connectionNotReady });
 				await delay(150 * (attempt + 1));
 			}
 		}
@@ -690,7 +715,8 @@ export class BrowserSession extends DurableObject<Env> {
 			}
 			else if (sessionId && !previousOperation) {
 				let browser: Browser | undefined;
-				try { browser = await this.connectToBrowserSession(sessionId); }
+				const cached = this.cachedBrowserConnection?.sessionId === sessionId ? this.cachedBrowserConnection.browser : undefined;
+				try { browser = cached?.connected ? cached : await this.connectToBrowserSession(sessionId, requestId); }
 				catch (error) { persistenceWarning = `Could not connect to save the latest browser state: ${String((error as Error)?.message ?? error).slice(0, 250)}`; }
 				if (browser) {
 					try { await withTimeout(this.persistState(browser), STATE_PERSIST_TIMEOUT_MS, "Saving browser state before close"); }
@@ -700,6 +726,8 @@ export class BrowserSession extends DurableObject<Env> {
 			} else if (sessionId && previousOperation) {
 				persistenceWarning = `The latest state was not snapshotted because ${previousOperation.op} was still running; the previous saved state was preserved.`;
 			}
+			const cached = this.cachedBrowserConnection;
+			if (sessionId && cached?.sessionId === sessionId) await this.disconnectBrowser(cached.browser);
 
 			if (!sessionId) {
 				const durationMs = Date.now() - requestStartedAt;
@@ -744,6 +772,8 @@ export class BrowserSession extends DurableObject<Env> {
 		this.closeOperation = { requestId, op: "clear_saved_state", startedAt: Date.now() };
 		try {
 			if (this.pendingDialogBrowser) await this.closePendingDialogBrowser();
+			const cached = this.cachedBrowserConnection;
+			if (sessionId && cached?.sessionId === sessionId) await this.disconnectBrowser(cached.browser);
 			const close = sessionId ? await this.closeBrowserRunSession(sessionId) : { closed: false, status: "unknown" as const };
 			await this.ctx.storage.delete(["browserStateRecord", "browserConnectionFailure"]);
 			if (sessionId && !close.closed) {
@@ -973,6 +1003,7 @@ export class BrowserSession extends DurableObject<Env> {
 
 	private async connectBrowser(allowLaunch: boolean, operationEpoch?: number): Promise<{ browser?: Browser; sessionId?: string; created: boolean; tabIdMappings?: Array<{ previousTabId: string; tabId: string; url: string }> }> {
 		let sessionId = await this.storedSessionId();
+		if (!sessionId && this.cachedBrowserConnection) await this.disconnectBrowser(this.cachedBrowserConnection.browser);
 		if (sessionId) {
 			const pendingClose = await this.ctx.storage.get<BrowserClosePending>("browserClosePending");
 			if (pendingClose?.sessionId === sessionId) {
@@ -983,6 +1014,18 @@ export class BrowserSession extends DurableObject<Env> {
 			}
 		}
 		if (sessionId) {
+			const cached = this.cachedBrowserConnection;
+			if (cached && cached.sessionId === sessionId && cached.browser.connected && cached.socket.readyState === WebSocket.OPEN) {
+				const currentRequestId = this.activeOperation?.requestId ?? crypto.randomUUID();
+				if (operationEpoch !== undefined && operationEpoch !== this.lockEpoch) {
+					await this.disconnectBrowser(cached.browser);
+					throw Object.assign(new Error("This browser operation was canceled because the session was closed."), { code: "BROWSER_OPERATION_CANCELED" });
+				}
+				console.info("Reusing Browser Run CDP connection", { requestId: currentRequestId, sessionTag: sessionId.slice(-8), socketState: cached.socket.readyState });
+				await this.clearCdpFailure(sessionId);
+				return { browser: cached.browser, sessionId, created: false };
+			}
+			if (cached) await this.disconnectBrowser(cached.browser);
 			let sessionActive: boolean | undefined;
 			try {
 				sessionActive = Boolean(await withTimeout(this.env.BROWSER.getSession(sessionId), BROWSER_API_TIMEOUT_MS, "Checking Browser Run session"));
@@ -995,7 +1038,8 @@ export class BrowserSession extends DurableObject<Env> {
 				sessionId = undefined;
 			} else {
 				try {
-					const browser = await this.connectToBrowserSession(sessionId);
+					const requestId = this.activeOperation?.requestId ?? crypto.randomUUID();
+					const browser = await this.connectToBrowserSession(sessionId, requestId);
 					if (operationEpoch !== undefined && operationEpoch !== this.lockEpoch) { await this.disconnectBrowser(browser); throw Object.assign(new Error("This browser operation was canceled because the session was closed."), { code: "BROWSER_OPERATION_CANCELED" }); }
 					await this.clearCdpFailure(sessionId);
 					return { browser, sessionId, created: false };
@@ -1045,7 +1089,7 @@ export class BrowserSession extends DurableObject<Env> {
 		let tabIdMappings: Array<{ previousTabId: string; tabId: string; url: string }> = [];
 		try {
 			await this.ctx.storage.put("browserSessionId", sessionId);
-			browser = await this.connectWithEndpoint(launched, sessionId);
+			browser = await this.connectWithEndpoint(launched, sessionId, this.activeOperation?.requestId ?? crypto.randomUUID());
 			await this.clearCdpFailure(sessionId);
 			tabIdMappings = await this.restoreState(browser);
 			console.info("Browser session started", { tabIdMappingCount: tabIdMappings.length });
@@ -1140,11 +1184,16 @@ export class BrowserSession extends DurableObject<Env> {
 		}
 		if (op === "resume") {
 			try {
-			const tabs = await listTabs(browser);
-			assertCurrentEpoch();
-			return { structuredContent: { active: true, restored: connection.created, tabs, ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
+				const tabs = await listTabs(browser);
+				assertCurrentEpoch();
+				return { structuredContent: { active: true, restored: connection.created, tabs, ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
+			} catch (error) {
+				if (["CDP_COMMAND_TIMEOUT", "BROWSER_SESSION_LOST"].includes((error as { code?: string })?.code ?? this.errorCode(error))) {
+					console.error("Browser Run CDP resume failed", { requestId: this.activeOperation?.requestId, op, sessionTag: connection.sessionId?.slice(-8), message: String((error as Error)?.message ?? error).slice(0, 300) });
+					await this.disconnectBrowser(browser);
+				}
+				throw error;
 			}
-			finally { await this.disconnectBrowser(browser); }
 		}
 		let result: SessionResult | undefined;
 		let operationError: unknown;
@@ -1154,7 +1203,18 @@ export class BrowserSession extends DurableObject<Env> {
 			if (connection.tabIdMappings?.length && result.structuredContent) result.structuredContent = { ...result.structuredContent, tabIdMappings: connection.tabIdMappings };
 		} catch (error) {
 			operationError = error;
-			if ((error as { code?: string })?.code === "CDP_COMMAND_TIMEOUT") await this.disconnectBrowser(browser);
+			const errorCode = (error as { code?: string })?.code ?? this.errorCode(error);
+			if (["CDP_COMMAND_TIMEOUT", "BROWSER_SESSION_LOST"].includes(errorCode)) {
+				console.error("Browser Run CDP operation failed", {
+					requestId: this.activeOperation?.requestId,
+					op,
+					sessionTag: connection.sessionId?.slice(-8),
+					code: errorCode,
+					socketState: this.cachedBrowserConnection?.browser === browser ? this.cachedBrowserConnection.socket.readyState : "uncached",
+					message: String((error as Error)?.message ?? error).slice(0, 300),
+				});
+				await this.disconnectBrowser(browser);
+			}
 		} finally {
 			if ((operationEpoch === undefined || operationEpoch === this.lockEpoch) && (operationError as { code?: string } | undefined)?.code !== "CDP_COMMAND_TIMEOUT" && MUTATING_OPS.has(op) && result?.structuredContent?.dialogPending !== true && !(operationError as Json | undefined)?.dialogPending) {
 				try { await this.persistState(browser); }
@@ -1167,7 +1227,7 @@ export class BrowserSession extends DurableObject<Env> {
 			if (operationHasDialog && this.pendingDialogResolver && connection.sessionId) {
 				this.pendingDialogBrowser = browser;
 				this.pendingDialogSessionId = connection.sessionId;
-			} else await this.disconnectBrowser(browser);
+			}
 		}
 		if (operationError) {
 			if (connection.tabIdMappings?.length && operationError && typeof operationError === "object") (operationError as Json).tabIdMappings = connection.tabIdMappings;
