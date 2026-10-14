@@ -83,10 +83,11 @@ async function evaluatePage(page: Page, expression: string, timeoutMs = 10_000):
 }
 
 type DialogInfo = { type: string; message: string; defaultPrompt?: string };
-type ObservedEvaluation = { result?: unknown; dialog?: DialogInfo; dialogPending?: true };
+type ObservedEvaluation = { result?: unknown; dialog?: DialogInfo; dialogPending?: true; session?: CDPSession };
 
 async function evaluatePageWithDialog(page: Page, expression: string, timeoutMs = 10_000): Promise<ObservedEvaluation> {
 	const session = await page.createCDPSession();
+	let keepSessionOpen = false;
 	let resolveDialog!: (value: DialogInfo) => void;
 	const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
 	const onDialog = (event: { type?: string; message?: string; defaultPrompt?: string }) => resolveDialog({
@@ -100,35 +101,33 @@ async function evaluatePageWithDialog(page: Page, expression: string, timeoutMs 
 		const evaluation = session.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true, userGesture: true, timeout: Math.min(Math.max(timeoutMs, 1), 30_000) })
 			.then((value) => ({ kind: "result" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
 		const outcome = await Promise.race([evaluation, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
-		if (outcome.kind === "dialog") return { dialog: outcome.dialog, dialogPending: true };
+		if (outcome.kind === "dialog") {
+			keepSessionOpen = true;
+			return { dialog: outcome.dialog, dialogPending: true, session };
+		}
 		if (outcome.kind === "error") throw outcome.error;
 		if (outcome.value.exceptionDetails) throw Object.assign(new Error(outcome.value.exceptionDetails.exception?.description ?? outcome.value.exceptionDetails.text ?? "Page evaluation failed."), { code: "PAGE_EVALUATION_ERROR" });
 		return { result: outcome.value.result?.value ?? null };
 	} finally {
 		session.off("Page.javascriptDialogOpening", onDialog);
-		await session.detach().catch(() => undefined);
+		if (!keepSessionOpen) await session.detach().catch(() => undefined);
 	}
 }
 
 async function applyViewport(page: Page, viewport: PersistedViewport): Promise<void> {
-	const current = await page.evaluate(() => ({
-		width: innerWidth,
-		height: innerHeight,
-		deviceScaleFactor: devicePixelRatio,
-		hasTouch: navigator.maxTouchPoints > 0,
-	})).catch(() => null);
-	if (current
-		&& current.width === viewport.width
-		&& current.height === viewport.height
-		&& Math.abs(current.deviceScaleFactor - viewport.deviceScaleFactor) < 0.01
-		&& current.hasTouch === viewport.mobile) return;
-	await page.setViewport({
+	// `page.setViewport()` may reload when Puppeteer reconnects to an existing
+	// mobile page, because the newly created Page wrapper has no cached viewport
+	// state. Use the Page's primary CDP session to restore emulation without a
+	// navigation or reload.
+	const session = (page as any)._client() as CDPSession;
+	await session.send("Emulation.setDeviceMetricsOverride", {
 		width: viewport.width,
 		height: viewport.height,
 		deviceScaleFactor: viewport.deviceScaleFactor,
-		isMobile: viewport.mobile,
-		hasTouch: viewport.mobile,
+		mobile: viewport.mobile,
+		screenOrientation: { angle: 0, type: "portraitPrimary" },
 	});
+	await session.send("Emulation.setTouchEmulationEnabled", { enabled: viewport.mobile });
 }
 
 function getTabId(page: Page): string {
@@ -308,6 +307,11 @@ async function browserStatus(env: Env, sessionId: string | undefined) {
 
 export class BrowserSession extends DurableObject<Env> {
 	private lock: Promise<void> = Promise.resolve();
+	private pendingDialogSession?: CDPSession;
+	private pendingDialogResolver?: (accept: boolean, promptText?: string) => Promise<void>;
+	private pendingDialogPage?: Page;
+	private pendingDialogBrowser?: Browser;
+	private pendingDialogSessionId?: string;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -360,17 +364,66 @@ export class BrowserSession extends DurableObject<Env> {
 
 	private async handleDialogOutOfBand(request: SessionRequest): Promise<SessionResult> {
 		const input = request.input ?? {};
-		const connection = await this.connectBrowser(false);
-		if (!connection.browser) throw Object.assign(new Error("There is no active browser session to handle a JavaScript dialog."), { code: "NO_ACTIVE_BROWSER" });
-		const browser = connection.browser;
-		try {
-			const page = await pickPage(browser, input.tabId ? String(input.tabId) : undefined);
-			const session = await page.createCDPSession();
+		const page = this.pendingDialogPage;
+		const browser = this.pendingDialogBrowser;
+		const resolveDialog = this.pendingDialogResolver;
+		if (page && browser && resolveDialog) {
+			const activeSessionId = await this.storedSessionId();
+			if (this.pendingDialogSessionId && activeSessionId !== this.pendingDialogSessionId) {
+				throw Object.assign(new Error("The browser session changed while a JavaScript dialog was pending."), { code: "DIALOG_SESSION_MISMATCH" });
+			}
+			if (input.tabId && String(input.tabId) !== getTabId(page)) {
+				throw Object.assign(new Error(`A JavaScript dialog is pending in tab ${getTabId(page)}.`), { code: "DIALOG_TAB_MISMATCH" });
+			}
+			let persistenceWarning: string | undefined;
 			try {
-				await session.send("Page.handleJavaScriptDialog", { accept: Boolean(input.accept), ...(input.promptText !== undefined ? { promptText: String(input.promptText) } : {}) });
-				return { structuredContent: { handled: true, tabId: getTabId(page), url: page.url() } };
-			} finally { await session.detach().catch(() => undefined); }
-		} finally { browser.disconnect(); }
+				await resolveDialog(Boolean(input.accept), input.promptText === undefined ? undefined : String(input.promptText));
+				try { await this.persistState(browser); }
+				catch (error) { persistenceWarning = (error as Error).message; }
+				return { structuredContent: { handled: true, tabId: getTabId(page), url: page.url(), ...(persistenceWarning ? { persistenceWarning } : {}) } };
+			} finally {
+				const session = this.pendingDialogSession;
+				this.pendingDialogSession = undefined;
+				this.pendingDialogResolver = undefined;
+				this.pendingDialogPage = undefined;
+				this.pendingDialogBrowser = undefined;
+				this.pendingDialogSessionId = undefined;
+				if (session) await session.detach().catch(() => undefined);
+				browser.disconnect();
+			}
+		}
+		throw Object.assign(new Error("The CDP connection for this dialog is no longer available. Close the browser session and resume it before continuing."), { code: "DIALOG_CONNECTION_LOST" });
+	}
+
+	private holdDialogSession(page: Page, session: CDPSession): void {
+		this.pendingDialogSession = session;
+		this.pendingDialogPage = page;
+		this.pendingDialogResolver = (accept, promptText) => (session as any).send("Page.handleJavaScriptDialog", {
+			accept,
+			...(promptText !== undefined ? { promptText } : {}),
+		}, { timeout: 10_000 });
+	}
+
+	private holdPuppeteerDialog(page: Page, dialog: { accept(promptText?: string): Promise<void>; dismiss(): Promise<void> }): void {
+		if (this.pendingDialogResolver) return;
+		this.pendingDialogPage = page;
+		this.pendingDialogResolver = (accept, promptText) => accept ? dialog.accept(promptText) : dialog.dismiss();
+	}
+
+	private async closePendingDialogBrowser(): Promise<void> {
+		const session = this.pendingDialogSession;
+		const browser = this.pendingDialogBrowser;
+		try { await this.pendingDialogResolver?.(false); } catch { /* Closing the browser is the final cleanup path. */ }
+		this.pendingDialogSession = undefined;
+		this.pendingDialogResolver = undefined;
+		this.pendingDialogPage = undefined;
+		this.pendingDialogBrowser = undefined;
+		this.pendingDialogSessionId = undefined;
+		if (session) await session.detach().catch(() => undefined);
+		if (browser) {
+			try { await browser.close(); }
+			catch { browser.disconnect(); }
+		}
 	}
 
 	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
@@ -484,6 +537,26 @@ export class BrowserSession extends DurableObject<Env> {
 		await this.saveStateRecord({ ...state, tabs });
 	}
 
+	private async applySavedViewport(browser: Browser, tabId?: string): Promise<void> {
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state?.tabs.length) return;
+		const pages = await browser.pages();
+		const page = tabId ? pages.find((candidate) => getTabId(candidate) === tabId) : pages[0];
+		if (!page) return;
+		const saved = state.tabs.find((tab) => tab.tabId === getTabId(page))?.viewport;
+		if (saved) await applyViewport(page, saved);
+	}
+
+	private async applySavedViewports(browser: Browser): Promise<void> {
+		const state = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
+		if (!state?.tabs.length) return;
+		const viewportByTabId = new Map(state.tabs.filter((tab) => tab.tabId && tab.viewport).map((tab) => [tab.tabId!, tab.viewport!]));
+		for (const page of await browser.pages()) {
+			const saved = viewportByTabId.get(getTabId(page));
+			if (saved) await applyViewport(page, saved);
+		}
+	}
+
 	private async reconcileTabIds(browser: Browser): Promise<Array<{ previousTabId: string; tabId: string; url: string }>> {
 		const record = await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord");
 		const state = record?.state;
@@ -546,8 +619,16 @@ export class BrowserSession extends DurableObject<Env> {
 			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
 			return { structuredContent: { ...status, restorableTabs: saved?.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).map((tab) => ({ previousTabId: tab.tabId, url: tab.url })) ?? [] } };
 		}
+		if (this.pendingDialogResolver && op !== "close_session" && op !== "clear_saved_state") {
+			throw Object.assign(new Error("A JavaScript dialog is open. Call browser_handle_dialog before other browser operations."), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true });
+		}
 		if (op === "close_session") {
 			const sessionId = await this.storedSessionId();
+			if (this.pendingDialogBrowser) {
+				await this.closePendingDialogBrowser();
+				await this.ctx.storage.delete("browserSessionId");
+				return { structuredContent: { closed: Boolean(sessionId) } };
+			}
 			if (sessionId) {
 				let browser: Browser | undefined;
 				try { browser = await puppeteer.connect(this.env.BROWSER as any, sessionId); }
@@ -563,6 +644,7 @@ export class BrowserSession extends DurableObject<Env> {
 		}
 		if (op === "clear_saved_state") {
 			const sessionId = await this.storedSessionId();
+			if (this.pendingDialogBrowser) await this.closePendingDialogBrowser();
 			if (sessionId) {
 				try { const browser = await puppeteer.connect(this.env.BROWSER as any, sessionId); await browser.close(); }
 				catch { /* Already expired or closed. */ }
@@ -588,6 +670,10 @@ export class BrowserSession extends DurableObject<Env> {
 			const remapped = connection.tabIdMappings?.find((mapping) => mapping.previousTabId === input.tabId);
 			if (remapped) operationInput = { ...input, tabId: remapped.tabId };
 		}
+		if (op === "resume" || op === "list_tabs") await this.applySavedViewports(browser);
+		else if (op !== "new_tab" && op !== "close_tab") {
+			await this.applySavedViewport(browser, typeof operationInput.tabId === "string" ? operationInput.tabId : undefined);
+		}
 		if (op === "resume") {
 			try {
 				return { structuredContent: { active: true, restored: connection.created, tabs: await listTabs(browser), ...(connection.tabIdMappings?.length ? { tabIdMappings: connection.tabIdMappings } : {}) } };
@@ -609,7 +695,11 @@ export class BrowserSession extends DurableObject<Env> {
 					else if (operationError && typeof operationError === "object") (operationError as Json).persistenceWarning = (error as Error).message;
 				}
 			}
-			browser.disconnect();
+			const operationHasDialog = result?.structuredContent?.dialogPending === true || Boolean((operationError as Json | undefined)?.dialogPending);
+			if (operationHasDialog && this.pendingDialogResolver && connection.sessionId) {
+				this.pendingDialogBrowser = browser;
+				this.pendingDialogSessionId = connection.sessionId;
+			} else browser.disconnect();
 		}
 		if (operationError) {
 			if (connection.tabIdMappings?.length && operationError && typeof operationError === "object") (operationError as Json).tabIdMappings = connection.tabIdMappings;
@@ -682,6 +772,7 @@ export class BrowserSession extends DurableObject<Env> {
 		if (op === "evaluate") {
 			const evaluation = await evaluatePageWithDialog(page, String(input.expression), Number(input.timeoutMs ?? 10_000));
 			if (evaluation.dialogPending) {
+				if (evaluation.session) this.holdDialogSession(page, evaluation.session);
 				const prompt = "A JavaScript dialog is open. Call browser_handle_dialog to accept or dismiss it.";
 				return { structuredContent: { dialogPending: true, dialog: evaluation.dialog, page: { tabId: getTabId(page), url: page.url() } }, content: [{ type: "text", text: prompt }] };
 			}
@@ -704,6 +795,7 @@ export class BrowserSession extends DurableObject<Env> {
 		}
 		if (op === "mouse") {
 			const session = await page.createCDPSession();
+			let keepSessionOpen = false;
 			let dialogInfo: DialogInfo | undefined;
 			let resolveDialog!: (value: DialogInfo) => void;
 			const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
@@ -738,21 +830,28 @@ export class BrowserSession extends DurableObject<Env> {
 				const settleStartedAt = Date.now();
 				await Promise.race([delay(action === "click" ? 250 : 50), dialogOpened]);
 				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
-				if (dialogInfo) return { structuredContent: { action, x, y, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (dialogInfo) {
+					this.holdDialogSession(page, session); keepSessionOpen = true;
+					return { structuredContent: { action, x, y, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				}
 				const metadataStartedAt = Date.now();
 				const metadata = pageSummary(page).then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
 				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 				timings.metadataMs = Date.now() - metadataStartedAt;
-				if (outcome.kind === "dialog") return { structuredContent: { action, x, y, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (outcome.kind === "dialog") {
+					this.holdDialogSession(page, session); keepSessionOpen = true;
+					return { structuredContent: { action, x, y, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				}
 				if (outcome.kind === "error") throw outcome.error;
 				return { structuredContent: { action, x, y, page: outcome.value, timings } };
 			} finally {
 				session.off("Page.javascriptDialogOpening", onDialog);
-				await session.detach().catch(() => undefined);
+				if (!keepSessionOpen) await session.detach().catch(() => undefined);
 			}
 		}
 		if (op === "keyboard") {
 			const session = await page.createCDPSession();
+			let keepSessionOpen = false;
 			let dialogInfo: DialogInfo | undefined;
 			let resolveDialog!: (value: DialogInfo) => void;
 			const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
@@ -781,17 +880,23 @@ export class BrowserSession extends DurableObject<Env> {
 				const settleStartedAt = Date.now();
 				await Promise.race([delay(150), dialogOpened]);
 				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
-				if (dialogInfo) return { structuredContent: { action, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (dialogInfo) {
+					this.holdDialogSession(page, session); keepSessionOpen = true;
+					return { structuredContent: { action, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				}
 				const metadataStartedAt = Date.now();
 				const metadata = pageSummary(page).then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
 				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 				timings.metadataMs = Date.now() - metadataStartedAt;
-				if (outcome.kind === "dialog") return { structuredContent: { action, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				if (outcome.kind === "dialog") {
+					this.holdDialogSession(page, session); keepSessionOpen = true;
+					return { structuredContent: { action, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+				}
 				if (outcome.kind === "error") throw outcome.error;
 				return { structuredContent: { action, page: outcome.value, timings } };
 			} finally {
 				session.off("Page.javascriptDialogOpening", onDialog);
-				await session.detach().catch(() => undefined);
+				if (!keepSessionOpen) await session.detach().catch(() => undefined);
 			}
 		}
 		if (op === "handle_dialog") {
@@ -822,6 +927,7 @@ export class BrowserSession extends DurableObject<Env> {
 	private async performAction(page: Page, input: Json): Promise<SessionResult> {
 		const action = String(input.action ?? "");
 		const session = await page.createCDPSession();
+		let keepSessionOpen = false;
 		let dialogInfo: DialogInfo | undefined;
 		let resolveDialog!: (value: DialogInfo) => void;
 		const dialogOpened = new Promise<DialogInfo>((resolve) => { resolveDialog = resolve; });
@@ -868,6 +974,7 @@ export class BrowserSession extends DurableObject<Env> {
 				const value = error as { dialogPending?: boolean; dialog?: DialogInfo };
 				if (!dialogInfo && !value.dialogPending) throw error;
 				dialogInfo ??= value.dialog;
+				this.holdDialogSession(page, session); keepSessionOpen = true;
 				return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings: { targetResolutionMs, inputDispatchMs: Date.now() - dispatchStartedAt } } };
 			}
 			const inputDispatchMs = Date.now() - dispatchStartedAt;
@@ -876,18 +983,24 @@ export class BrowserSession extends DurableObject<Env> {
 			await Promise.race([delay(requestedSettleMs), dialogOpened]);
 			const settleMs = Date.now() - settleStartedAt;
 			const timings: Json = { targetResolutionMs, inputDispatchMs, settleMs };
-			if (dialogInfo) return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			if (dialogInfo) {
+				this.holdDialogSession(page, session); keepSessionOpen = true;
+				return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			}
 			const metadataStartedAt = Date.now();
 			const metadata = (async () => ({ page: await pageSummary(page), snapshot: input.includeSnapshot ? await snapshot(page, {}) : undefined }))()
 				.then((value) => ({ kind: "metadata" as const, value }), (error: unknown) => ({ kind: "error" as const, error }));
 			const metadataOutcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 			timings.metadataMs = Date.now() - metadataStartedAt;
-			if (metadataOutcome.kind === "dialog") return { structuredContent: { action, result, dialog: metadataOutcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			if (metadataOutcome.kind === "dialog") {
+				this.holdDialogSession(page, session); keepSessionOpen = true;
+				return { structuredContent: { action, result, dialog: metadataOutcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
+			}
 			if (metadataOutcome.kind === "error") throw metadataOutcome.error;
 			return { structuredContent: { action, result, ...metadataOutcome.value, timings } };
 		} finally {
 			session.off("Page.javascriptDialogOpening", onDialog);
-			await session.detach().catch(() => undefined);
+			if (!keepSessionOpen) await session.detach().catch(() => undefined);
 		}
 	}
 
@@ -950,7 +1063,10 @@ export class BrowserSession extends DurableObject<Env> {
 			}
 			else if (action.type === "evaluate") {
 				const outcome = await evaluatePageWithDialog(page, String(action.expression), Number(action.timeoutMs ?? 10_000));
-				if (outcome.dialogPending) return { structuredContent: { dialogPending: true, dialog: outcome.dialog, page: { tabId: getTabId(page), url: page.url() }, requests, droppedRequests } };
+				if (outcome.dialogPending) {
+					if (outcome.session) this.holdDialogSession(page, outcome.session);
+					return { structuredContent: { dialogPending: true, dialog: outcome.dialog, page: { tabId: getTabId(page), url: page.url() }, requests, droppedRequests } };
+				}
 			}
 			else throw Object.assign(new Error("Capture supports navigate, reload, click, or evaluate actions."), { code: "INVALID_ACTION" });
 			await delay(Math.min(Number(input.settleMs ?? 250), 5000));
@@ -972,11 +1088,18 @@ export class BrowserSession extends DurableObject<Env> {
 		let resolveSequenceDialog!: (value: DialogInfo) => void;
 		const sequenceDialogOpened = new Promise<DialogInfo>((resolve) => { resolveSequenceDialog = resolve; });
 		const watchedPages: Page[] = [];
-		const onPageDialog = (dialog: any) => {
+		const pageDialogHandlers = new Map<Page, (dialog: any) => void>();
+		const onPageDialog = (candidate: Page, dialog: any) => {
 			pendingDialog = { type: String(dialog.type()), message: String(dialog.message()), ...(dialog.defaultValue() ? { defaultPrompt: String(dialog.defaultValue()) } : {}) };
+			this.holdPuppeteerDialog(candidate, dialog);
 			resolveSequenceDialog(pendingDialog);
 		};
-		const watchPage = (candidate: Page) => { candidate.on("dialog", onPageDialog); watchedPages.push(candidate); };
+		const watchPage = (candidate: Page) => {
+			const handler = (dialog: any) => onPageDialog(candidate, dialog);
+			pageDialogHandlers.set(candidate, handler);
+			candidate.on("dialog", handler);
+			watchedPages.push(candidate);
+		};
 		const boundedResult = (value: unknown) => {
 			const serialized = JSON.stringify(value ?? null);
 			const remaining = Math.max(0, 80_000 - outputChars);
@@ -1020,6 +1143,7 @@ export class BrowserSession extends DurableObject<Env> {
 				} else if (step.type === "evaluate") {
 					const evaluation = await evaluatePageWithDialog(page, String(step.expression), Math.min(Number(step.timeoutMs ?? 10_000), Math.max(deadline - Date.now(), 1)));
 					if (evaluation.dialogPending) {
+						if (evaluation.session) this.holdDialogSession(page, evaluation.session);
 						stepResult = { dialogPending: true, dialog: evaluation.dialog };
 						outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, page: { tabId: getTabId(page), url: page.url() } });
 						dialogPending = true;
@@ -1055,7 +1179,10 @@ export class BrowserSession extends DurableObject<Env> {
 				if (input.stopOnError !== false) break;
 			}
 		}
-		for (const watchedPage of watchedPages) watchedPage.off("dialog", onPageDialog);
+		for (const watchedPage of watchedPages) {
+			const handler = pageDialogHandlers.get(watchedPage);
+			if (handler) watchedPage.off("dialog", handler);
+		}
 		return { structuredContent: { outcomes, ...(dialogPending ? { dialogPending: true } : { tabs: await listTabs(browser) }), durationMs: maxMs - Math.max(deadline - Date.now(), 0), stopOnError: input.stopOnError !== false } };
 	}
 
