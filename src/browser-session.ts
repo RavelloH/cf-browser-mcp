@@ -338,6 +338,8 @@ async function browserStatus(env: Env, sessionId: string | undefined) {
 
 export class BrowserSession extends DurableObject<Env> {
 	private lock: Promise<void> = Promise.resolve();
+	private activeOperation?: { requestId: string; op: string; startedAt: number };
+	private queuedOperations = 0;
 	private pendingDialogSession?: CDPSession;
 	private pendingDialogResolver?: (accept: boolean, promptText?: string) => Promise<void>;
 	private pendingDialogPage?: Page;
@@ -351,19 +353,20 @@ export class BrowserSession extends DurableObject<Env> {
 	async fetch(request: Request): Promise<Response> {
 		if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { allow: "POST" } });
 		const startedAt = Date.now();
+		const requestId = crypto.randomUUID();
 		let input: SessionRequest;
 		try { input = await request.json() as SessionRequest; }
-		catch { return jsonResponse({ isError: true, code: "INVALID_INPUT", message: "Request body must be valid JSON.", durationMs: Date.now() - startedAt }); }
+		catch { return jsonResponse({ isError: true, requestId, code: "INVALID_INPUT", message: "Request body must be valid JSON.", durationMs: Date.now() - startedAt }); }
 		// A modal dialog can suspend the request that opened it while holding the
 		// session queue. Dismiss/accept it out of band so that request can resume.
 		if (input.op === "handle_dialog") {
 			try {
 				const result = await this.handleDialogOutOfBand(input);
-				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				result.structuredContent = { ...(result.structuredContent ?? {}), requestId, durationMs: Date.now() - startedAt };
 				return jsonResponse(result);
 			} catch (error) {
 				const value = error as { code?: string; message?: string; [key: string]: unknown };
-				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
+				return jsonResponse({ isError: true, requestId, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
 			}
 		}
 		// This recovery operation only edits saved tab metadata and remains
@@ -371,11 +374,11 @@ export class BrowserSession extends DurableObject<Env> {
 		if (input.op === "forget_saved_tab") {
 			try {
 				const result = await this.forgetSavedTab(input.input ?? {});
-				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				result.structuredContent = { ...(result.structuredContent ?? {}), requestId, durationMs: Date.now() - startedAt };
 				return jsonResponse(result);
 			} catch (error) {
 				const value = error as { code?: string; message?: string };
-				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
+				return jsonResponse({ isError: true, requestId, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
 			}
 		}
 		// This operation only reads Durable Object storage and Browser Run session
@@ -383,27 +386,41 @@ export class BrowserSession extends DurableObject<Env> {
 		if (input.op === "status") {
 			try {
 				const result = await this.dispatch(input);
-				result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+				result.structuredContent = { ...(result.structuredContent ?? {}), requestId, durationMs: Date.now() - startedAt };
 				return jsonResponse(result);
 			} catch (error) {
 				const value = error as { code?: string; message?: string };
-				return jsonResponse({ isError: true, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
+				return jsonResponse({ isError: true, requestId, code: this.errorCode(error), message: value.message ?? String(error), durationMs: Date.now() - startedAt });
 			}
 		}
 		const previous = this.lock;
 		let release!: () => void;
 		this.lock = new Promise<void>((resolve) => { release = resolve; });
-		await previous;
+		this.queuedOperations++;
+		const queuedAt = Date.now();
+		let acquired = false;
 		try {
+			await previous;
+			this.queuedOperations--;
+			acquired = true;
+			const operationStartedAt = Date.now();
+			this.activeOperation = { requestId, op: input.op, startedAt: operationStartedAt };
+			const queueWaitMs = operationStartedAt - queuedAt;
+			if (queueWaitMs >= 1_000 || input.op === "resume") console.info("Browser operation lock acquired", { requestId, op: input.op, queueWaitMs, queuedOperations: this.queuedOperations });
 			const result = await this.dispatch(input);
-			result.structuredContent = { ...(result.structuredContent ?? {}), durationMs: Date.now() - startedAt };
+			result.structuredContent = { ...(result.structuredContent ?? {}), requestId, durationMs: Date.now() - startedAt };
 			return jsonResponse(result);
 		} catch (error) {
 			const value = error as { code?: string; message?: string; [key: string]: unknown };
 			const code = this.errorCode(error);
-			if (code === "BROWSER_SESSION_LOST" || code === "BROWSER_CONNECTION_FAILED") console.warn("Browser session operation failed", { op: input.op, code, message: String(value.message ?? error).slice(0, 500), durationMs: Date.now() - startedAt });
-			return jsonResponse({ isError: true, code, message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.snapshotId ? { snapshotId: value.snapshotId } : {}), ...(value.matches ? { matches: value.matches } : {}), ...(value.persistenceWarning ? { persistenceWarning: value.persistenceWarning } : {}), ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
+			if (code === "BROWSER_SESSION_LOST" || code === "BROWSER_CONNECTION_FAILED") console.warn("Browser session operation failed", { requestId, op: input.op, code, message: String(value.message ?? error).slice(0, 500), durationMs: Date.now() - startedAt });
+			return jsonResponse({ isError: true, requestId, code, message: value.message ?? String(error), durationMs: Date.now() - startedAt, ...(value.snapshotId ? { snapshotId: value.snapshotId } : {}), ...(value.matches ? { matches: value.matches } : {}), ...(value.persistenceWarning ? { persistenceWarning: value.persistenceWarning } : {}), ...(value.tabIdMappings ? { tabIdMappings: value.tabIdMappings } : {}), ...(value.dialogPending ? { dialogPending: true, dialog: value.dialog } : {}) });
 		} finally {
+			if (!acquired) this.queuedOperations--;
+			if (acquired) {
+				if (Date.now() - startedAt >= 5_000) console.info("Browser operation lock released", { requestId, op: input.op, durationMs: Date.now() - startedAt, queuedOperations: this.queuedOperations });
+				this.activeOperation = undefined;
+			}
 			release();
 		}
 	}
@@ -482,6 +499,10 @@ export class BrowserSession extends DurableObject<Env> {
 	}
 
 	private async storedSessionId() { return await this.ctx.storage.get<string>("browserSessionId"); }
+
+	private async listBrowserSessions() {
+		return await withTimeout(puppeteer.sessions(this.env.BROWSER as any), CDP_COMMAND_TIMEOUT_MS, "Checking Browser Run sessions");
+	}
 
 	private async forgetSavedTab(input: Record<string, unknown>): Promise<SessionResult> {
 		const previousTabId = typeof input.previousTabId === "string" ? input.previousTabId.trim() : "";
@@ -688,15 +709,36 @@ export class BrowserSession extends DurableObject<Env> {
 	private async connectBrowser(allowLaunch: boolean): Promise<{ browser?: Browser; sessionId?: string; created: boolean; tabIdMappings?: Array<{ previousTabId: string; tabId: string; url: string }> }> {
 		let sessionId = await this.storedSessionId();
 		if (sessionId) {
-			try { return { browser: await puppeteer.connect(this.env.BROWSER as any, sessionId), sessionId, created: false }; }
-			catch (error) {
-				console.warn("Browser Run reconnect failed", { message: String((error as Error)?.message ?? error).slice(0, 500) });
-				const stillActive = await puppeteer.sessions(this.env.BROWSER as any)
-					.then((sessions) => sessions.some((session) => session.sessionId === sessionId))
-					.catch(() => false);
-				if (stillActive) throw Object.assign(new Error("The Browser Run session still exists, but its CDP connection failed. Retry the operation; the session will not be replaced automatically."), { code: "BROWSER_CONNECTION_FAILED" });
+			let active: boolean | undefined;
+			try {
+				const sessions = await this.listBrowserSessions();
+				active = sessions.some((session) => session.sessionId === sessionId);
+			} catch (error) {
+				console.warn("Browser Run session check failed", { message: String((error as Error)?.message ?? error).slice(0, 300) });
+			}
+			if (active === false) {
+				console.info("Stored Browser Run session is no longer active", { op: allowLaunch ? "launch_allowed" : "read_only" });
 				await this.ctx.storage.delete("browserSessionId");
 				sessionId = undefined;
+			} else {
+				try {
+					const browser = await withTimeout(puppeteer.connect(this.env.BROWSER as any, sessionId), 10_000, "Connecting to Browser Run session");
+					return { browser, sessionId, created: false };
+				} catch (error) {
+					console.warn("Browser Run reconnect failed", { timedOut: (error as { code?: string })?.code === "CDP_COMMAND_TIMEOUT", message: String((error as Error)?.message ?? error).slice(0, 300) });
+					let stillActive: boolean | undefined;
+					try {
+						const sessions = await this.listBrowserSessions();
+						stillActive = sessions.some((session) => session.sessionId === sessionId);
+					} catch { /* Preserve the stored ID when session status is unknown. */ }
+					if (stillActive !== false) {
+						throw Object.assign(new Error(stillActive === true
+							? "The Browser Run session is active, but its CDP connection failed or timed out. Retry the operation; the session will not be replaced automatically."
+							: "The Browser Run session could not be checked or reconnected. Retry the operation; the stored session will be preserved."), { code: "BROWSER_CONNECTION_FAILED" });
+					}
+					await this.ctx.storage.delete("browserSessionId");
+					sessionId = undefined;
+				}
 			}
 		}
 		if (!allowLaunch) return { created: false };
@@ -721,7 +763,7 @@ export class BrowserSession extends DurableObject<Env> {
 			const sessionId = await this.storedSessionId();
 			const status = await browserStatus(this.env, sessionId);
 			const saved = (await this.ctx.storage.get<{ state: PersistedBrowserState }>("browserStateRecord"))?.state;
-			return { structuredContent: { ...status, restorableTabs: saved?.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).map((tab) => ({ previousTabId: tab.tabId, url: tab.url })) ?? [] } };
+			return { structuredContent: { ...status, sessionOperation: this.activeOperation ? { requestId: this.activeOperation.requestId, op: this.activeOperation.op, elapsedMs: Date.now() - this.activeOperation.startedAt } : null, queuedOperations: this.queuedOperations, restorableTabs: saved?.tabs.filter((tab) => /^https?:\/\//i.test(tab.url)).map((tab) => ({ previousTabId: tab.tabId, url: tab.url })) ?? [] } };
 		}
 		if (this.pendingDialogResolver && op !== "close_session" && op !== "clear_saved_state") {
 			throw Object.assign(new Error("A JavaScript dialog is open. Call browser_handle_dialog before other browser operations."), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true });

@@ -62,7 +62,7 @@ async function callSession(env: Env, props: Record<string, unknown>, op: string,
 	});
 	const result = await response.json() as SessionResult & { message?: string; code?: string };
 	if (!response.ok && !result.isError) return { isError: true, content: [{ type: "text", text: `${result.code ?? "BROWSER_ERROR"}: ${result.message ?? response.statusText}` }] };
-	if (result.isError) return { ...result, content: [{ type: "text", text: serializable({ code: result.code, message: result.message, snapshotId: result.snapshotId, matches: result.matches, tabIdMappings: result.tabIdMappings, dialogPending: (result as any).dialogPending, dialog: (result as any).dialog, durationMs: result.durationMs, persistenceWarning: result.persistenceWarning }) }] };
+	if (result.isError) return { ...result, content: [{ type: "text", text: serializable({ requestId: (result as any).requestId, code: result.code, message: result.message, snapshotId: result.snapshotId, matches: result.matches, tabIdMappings: result.tabIdMappings, dialogPending: (result as any).dialogPending, dialog: (result as any).dialog, durationMs: result.durationMs, persistenceWarning: result.persistenceWarning }) }] };
 	if (!result.content?.length) result.content = [{ type: "text", text: serializable(result.structuredContent ?? {}) }];
 	return result;
 }
@@ -79,7 +79,7 @@ export function createBrowserMcpServer(env: Env, props: Record<string, unknown>)
 		});
 	};
 
-	register("browser_status", "Show whether this OAuth grant has an active Cloudflare Browser session and which saved tabs can be restored. tabs is null when live tabs were not queried; use browser_list_tabs for the current targets.", {}, "status");
+	register("browser_status", "Show whether this OAuth grant has an active Cloudflare Browser session, saved tabs, and whether another browser operation is running or queued. sessionOperation includes the active operation's requestId, name, and elapsedMs; tabs is null when live tabs were not queried. Use browser_list_tabs for the current targets.", {}, "status");
 	register("browser_resume", "Start Chromium and restore saved cookies, localStorage, and tabs when the remote session is idle. Returns current tab IDs and previousTabId-to-tabId mappings when Chromium was restored.", {}, "resume");
 	register("browser_forget_saved_tab", "Remove one failed or unwanted restorable tab record by previousTabId without starting or closing Chromium. The session must be inactive; cookies and all localStorage are preserved.", { previousTabId: z.string().min(1).describe("The previousTabId shown by browser_status.restorableTabs.") }, "forget_saved_tab");
 	register("browser_list_tabs", "List open tabs with tabId, URL, title, and viewport. Does not start a browser.", {}, "list_tabs");

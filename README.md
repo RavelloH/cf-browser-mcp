@@ -94,7 +94,7 @@ JavaScript 原生弹窗会在操作结果中返回 `dialogPending`、弹窗类�
 
 向 agent 提供以下工作方式：
 
-1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。`tabs: null` 表示没有查询实时标签页；调用 `browser_list_tabs` 获取当前目标。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
+1. 用 `browser_status` 查看会话状态；它不启动 Chromium 或建立 CDP 连接。`sessionOperation` 和 `queuedOperations` 可显示当前正在执行或排队的操作，方便定位卡住的请求。`tabs: null` 表示没有查询实时标签页；调用 `browser_list_tabs` 获取当前目标。若远端 session 已休眠且有可恢复标签页，调用 `browser_resume` 后再 `browser_list_tabs`。
 2. 首次使用时用 `browser_navigate` 打开页面，或用 `browser_new_tab` 创建独立标签页。
 3. 保存并复用当前运行期返回的 `tabId`，每次操作都显式传入，避免多个 agent 误操作同一个标签页。Chromium 重启后使用 `browser_resume` 返回的 `tabIdMappings` 更新旧 ID。
 4. 用 `browser_snapshot` 或 `browser_find` 获取当前页面的角色、名称和引用，再执行操作。导航或页面大幅变化后重新取快照。
