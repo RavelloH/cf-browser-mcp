@@ -1244,7 +1244,7 @@ export class BrowserSession extends DurableObject<Env> {
 			} };
 		}
 		if (this.pendingDialogResolver && op !== "close_session" && op !== "clear_saved_state") {
-			throw Object.assign(new Error("A JavaScript dialog is open. Call browser_handle_dialog before other browser operations."), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true });
+			throw Object.assign(new Error("A JavaScript dialog is open. Call browser_handle_dialog before other browser operations."), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true, dialog: this.pendingDialogInfo });
 		}
 		if (op === "close_session") throw Object.assign(new Error("close_session must use the out-of-band close handler."), { code: "BROWSER_CLOSE_INTERNAL_ERROR" });
 		const readOnlyOps = new Set(["list_tabs", "activate_tab", "page_info", "handoff_status"]);
