@@ -378,6 +378,11 @@ export class BrowserSession extends DurableObject<Env> {
 	private pendingDialogPage?: Page;
 	private pendingDialogBrowser?: Browser;
 	private pendingDialogSessionId?: string;
+	private pendingDialogInfo?: DialogInfo;
+	private readonly pendingDialogWaiters = new Set<() => void>();
+	private readonly dialogWatchedBrowsers = new WeakSet<Browser>();
+	private readonly dialogWatchedPages = new WeakSet<Page>();
+	private readonly pageRequestIds = new WeakMap<Page, string>();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -394,7 +399,7 @@ export class BrowserSession extends DurableObject<Env> {
 		// session queue. Dismiss/accept it out of band so that request can resume.
 		if (input.op === "handle_dialog") {
 			try {
-				const result = await this.handleDialogOutOfBand(input);
+				const result = await this.handleDialogOutOfBand(input, requestId);
 				result.structuredContent = { ...(result.structuredContent ?? {}), requestId, durationMs: Date.now() - startedAt };
 				return jsonResponse(result);
 			} catch (error) {
@@ -483,8 +488,22 @@ export class BrowserSession extends DurableObject<Env> {
 		return "BROWSER_ERROR";
 	}
 
-	private async handleDialogOutOfBand(request: SessionRequest): Promise<SessionResult> {
+	private async handleDialogOutOfBand(request: SessionRequest, requestId: string): Promise<SessionResult> {
 		const input = request.input ?? {};
+		if (!this.pendingDialogResolver) {
+			const sessionId = await this.storedSessionId();
+			if (sessionId) {
+				const cached = this.cachedBrowserConnection?.sessionId === sessionId ? this.cachedBrowserConnection : undefined;
+				let browser = cached?.browser;
+				if (browser && (!browser.connected || cached?.socket.readyState !== WebSocket.OPEN)) {
+					await this.disconnectBrowser(browser);
+					browser = undefined;
+				}
+				if (!browser) browser = await this.connectToBrowserSession(sessionId, requestId);
+				if (cached && browser === cached.browser) await this.watchBrowserDialogs(browser, sessionId);
+			}
+			if (!this.pendingDialogResolver) await this.waitForPendingDialog();
+		}
 		const page = this.pendingDialogPage;
 		const browser = this.pendingDialogBrowser;
 		const resolveDialog = this.pendingDialogResolver;
@@ -497,11 +516,12 @@ export class BrowserSession extends DurableObject<Env> {
 				throw Object.assign(new Error(`A JavaScript dialog is pending in tab ${getTabId(page)}.`), { code: "DIALOG_TAB_MISMATCH" });
 			}
 			let persistenceWarning: string | undefined;
+			const dialog = this.pendingDialogInfo;
 			try {
-				await resolveDialog(Boolean(input.accept), input.promptText === undefined ? undefined : String(input.promptText));
+				await withTimeout(resolveDialog(Boolean(input.accept), input.promptText === undefined ? undefined : String(input.promptText)), 10_000, "Handling JavaScript dialog");
 				try { await this.persistState(browser); }
 				catch (error) { persistenceWarning = (error as Error).message; }
-				return { structuredContent: { handled: true, tabId: getTabId(page), url: page.url(), ...(persistenceWarning ? { persistenceWarning } : {}) } };
+				return { structuredContent: { handled: true, tabId: getTabId(page), url: page.url(), ...(dialog ? { dialog } : {}), ...(persistenceWarning ? { persistenceWarning } : {}) } };
 			} finally {
 				const session = this.pendingDialogSession;
 				this.pendingDialogSession = undefined;
@@ -509,26 +529,103 @@ export class BrowserSession extends DurableObject<Env> {
 				this.pendingDialogPage = undefined;
 				this.pendingDialogBrowser = undefined;
 				this.pendingDialogSessionId = undefined;
+				this.pendingDialogInfo = undefined;
 				if (session) await session.detach().catch(() => undefined);
-				await this.disconnectBrowser(browser);
+			}
+		}
+		const fallbackBrowser = this.pendingDialogBrowser ?? this.cachedBrowserConnection?.browser;
+		if (fallbackBrowser && input.tabId) {
+			const fallbackPage = await pickPage(fallbackBrowser, String(input.tabId));
+			const session = await fallbackPage.createCDPSession();
+			let persistenceWarning: string | undefined;
+			try {
+				await (session as any).send("Page.handleJavaScriptDialog", {
+					accept: Boolean(input.accept),
+					...(input.promptText !== undefined ? { promptText: String(input.promptText) } : {}),
+				}, { timeout: 10_000 });
+				try { await this.persistState(fallbackBrowser); }
+				catch (error) { persistenceWarning = (error as Error).message; }
+				return { structuredContent: { handled: true, tabId: getTabId(fallbackPage), url: fallbackPage.url(), ...(persistenceWarning ? { persistenceWarning } : {}) } };
+			} catch (error) {
+				throw Object.assign(new Error(`Could not handle a JavaScript dialog on tab ${getTabId(fallbackPage)}: ${String((error as Error)?.message ?? error).slice(0, 250)}`), { code: "DIALOG_NOT_OPEN" });
+			} finally {
+				await session.detach().catch(() => undefined);
 			}
 		}
 		throw Object.assign(new Error("The CDP connection for this dialog is no longer available. Close the browser session and resume it before continuing."), { code: "DIALOG_CONNECTION_LOST" });
 	}
 
-	private holdDialogSession(page: Page, session: CDPSession): void {
+	private async waitForPendingDialog(): Promise<void> {
+		if (this.pendingDialogResolver) return;
+		let wake!: () => void;
+		const observed = new Promise<void>((resolve) => { wake = resolve; });
+		this.pendingDialogWaiters.add(wake);
+		if (this.pendingDialogResolver) wake();
+		try {
+			await withTimeout(observed, 5_000, "Waiting for a JavaScript dialog");
+		} catch {
+			if (!this.pendingDialogResolver) throw Object.assign(new Error("No JavaScript dialog opened while waiting. Retry browser_handle_dialog after the page reports a dialog."), { code: "DIALOG_NOT_OPEN" });
+		} finally {
+			this.pendingDialogWaiters.delete(wake);
+		}
+	}
+
+	private async watchBrowserDialogs(browser: Browser, sessionId: string): Promise<void> {
+		if (!this.dialogWatchedBrowsers.has(browser)) {
+			this.dialogWatchedBrowsers.add(browser);
+			browser.on("targetcreated", (target) => {
+				if (target.type() !== "page") return;
+				void target.page().then((page) => {
+					if (page) this.watchPageDialogs(page, browser, sessionId);
+				}).catch((error: unknown) => {
+					console.warn("Could not attach JavaScript dialog listener to a new page", { sessionTag: sessionId.slice(-8), message: String((error as Error)?.message ?? error).slice(0, 200) });
+				});
+			});
+		}
+		try {
+			const pages = await withTimeout(browser.pages(), CDP_COMMAND_TIMEOUT_MS, "Listing pages while watching JavaScript dialogs");
+			for (const page of pages) this.watchPageDialogs(page, browser, sessionId);
+		} catch (error) {
+			console.warn("Could not enumerate pages while installing JavaScript dialog listeners", { sessionTag: sessionId.slice(-8), message: String((error as Error)?.message ?? error).slice(0, 200) });
+		}
+	}
+
+	private watchPageDialogs(page: Page, browser: Browser, sessionId: string): void {
+		if (this.dialogWatchedPages.has(page)) return;
+		this.dialogWatchedPages.add(page);
+		page.on("dialog", (dialog) => this.holdPuppeteerDialog(page, dialog, browser, sessionId, this.pageRequestIds.get(page)));
+	}
+
+	private holdDialogSession(page: Page, session: CDPSession, info?: DialogInfo): void {
+		if (this.pendingDialogResolver && this.pendingDialogPage === page) {
+			this.pendingDialogInfo ??= info;
+			void session.detach().catch(() => undefined);
+			return;
+		}
 		this.pendingDialogSession = session;
 		this.pendingDialogPage = page;
+		this.pendingDialogInfo = info;
 		this.pendingDialogResolver = (accept, promptText) => (session as any).send("Page.handleJavaScriptDialog", {
 			accept,
 			...(promptText !== undefined ? { promptText } : {}),
 		}, { timeout: 10_000 });
+		for (const wake of this.pendingDialogWaiters) wake();
 	}
 
-	private holdPuppeteerDialog(page: Page, dialog: { accept(promptText?: string): Promise<void>; dismiss(): Promise<void> }): void {
+	private holdPuppeteerDialog(page: Page, dialog: { type(): string; message(): string; defaultValue(): string; accept(promptText?: string): Promise<void>; dismiss(): Promise<void> }, browser?: Browser, sessionId?: string, requestId?: string): void {
 		if (this.pendingDialogResolver) return;
+		const info: DialogInfo = {
+			type: dialog.type(),
+			message: dialog.message(),
+			...(dialog.defaultValue() ? { defaultPrompt: dialog.defaultValue() } : {}),
+		};
 		this.pendingDialogPage = page;
+		this.pendingDialogInfo = info;
+		if (browser) this.pendingDialogBrowser = browser;
+		if (sessionId) this.pendingDialogSessionId = sessionId;
 		this.pendingDialogResolver = (accept, promptText) => accept ? dialog.accept(promptText) : dialog.dismiss();
+		console.info("JavaScript dialog captured", { requestId: this.activeOperation?.requestId ?? requestId, sessionTag: sessionId?.slice(-8), type: info.type });
+		for (const wake of this.pendingDialogWaiters) wake();
 	}
 
 	private async closePendingDialogBrowser(): Promise<void> {
@@ -542,6 +639,7 @@ export class BrowserSession extends DurableObject<Env> {
 		this.pendingDialogPage = undefined;
 		this.pendingDialogBrowser = undefined;
 		this.pendingDialogSessionId = undefined;
+		this.pendingDialogInfo = undefined;
 		if (session) await withTimeout(session.detach(), 1_000, "Detaching pending dialog session").catch(() => undefined);
 		await this.disconnectBrowser(browser);
 	}
@@ -616,6 +714,7 @@ export class BrowserSession extends DurableObject<Env> {
 			this.browserSockets.set(browser, endpoint.socket);
 			const cached = { sessionId, browser, socket: endpoint.socket, requestId };
 			this.cachedBrowserConnection = cached;
+			await this.watchBrowserDialogs(browser, sessionId);
 			endpoint.socket.addEventListener("close", (event) => {
 				if (this.cachedBrowserConnection === cached) this.cachedBrowserConnection = undefined;
 				console.warn("Browser Run CDP WebSocket closed", {
@@ -1180,7 +1279,11 @@ export class BrowserSession extends DurableObject<Env> {
 			if (remapped) operationInput = { ...input, tabId: remapped.tabId };
 		}
 		if (op !== "resume" && op !== "list_tabs" && op !== "new_tab" && op !== "close_tab") {
-			await this.applySavedViewport(browser, typeof operationInput.tabId === "string" ? operationInput.tabId : undefined);
+			try { await this.applySavedViewport(browser, typeof operationInput.tabId === "string" ? operationInput.tabId : undefined); }
+			catch (error) {
+				if (this.pendingDialogResolver) throw Object.assign(new Error("A JavaScript dialog opened while preparing the page. Call browser_handle_dialog before continuing."), { code: "JAVASCRIPT_DIALOG_OPEN", dialogPending: true, dialog: this.pendingDialogInfo });
+				throw error;
+			}
 		}
 		if (op === "resume") {
 			try {
@@ -1245,6 +1348,9 @@ export class BrowserSession extends DurableObject<Env> {
 		}
 		if (op === "new_tab") {
 			const page = await browser.newPage();
+			if (this.activeOperation?.requestId) this.pageRequestIds.set(page, this.activeOperation.requestId);
+			const connection = this.cachedBrowserConnection;
+			if (connection?.browser === browser) this.watchPageDialogs(page, browser, connection.sessionId);
 			if (typeof input.url === "string" && input.url) await page.goto(input.url, { waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
 			return { structuredContent: { tab: await pageSummary(page), tabs: await listTabs(browser) } };
 		}
@@ -1257,6 +1363,7 @@ export class BrowserSession extends DurableObject<Env> {
 			return { structuredContent: { closed: true, tabId, tabs: await listTabs(browser) } };
 		}
 		const page = await pickPage(browser, input.tabId ? String(input.tabId) : undefined, true);
+		if (this.activeOperation?.requestId) this.pageRequestIds.set(page, this.activeOperation.requestId);
 		if (op === "page_info") return { structuredContent: await pageSummary(page) };
 		if (op === "navigate") {
 			const response = await page.goto(String(input.url), { waitUntil: input.waitUntil ?? "domcontentloaded", timeout: Number(input.timeoutMs ?? 30_000) });
@@ -1301,7 +1408,7 @@ export class BrowserSession extends DurableObject<Env> {
 		if (op === "evaluate") {
 			const evaluation = await evaluatePageWithDialog(page, String(input.expression), Number(input.timeoutMs ?? 10_000));
 			if (evaluation.dialogPending) {
-				if (evaluation.session) this.holdDialogSession(page, evaluation.session);
+				if (evaluation.session) this.holdDialogSession(page, evaluation.session, evaluation.dialog);
 				const prompt = "A JavaScript dialog is open. Call browser_handle_dialog to accept or dismiss it.";
 				return { structuredContent: { dialogPending: true, dialog: evaluation.dialog, page: { tabId: getTabId(page), url: page.url() } }, content: [{ type: "text", text: prompt }] };
 			}
@@ -1360,7 +1467,7 @@ export class BrowserSession extends DurableObject<Env> {
 				await Promise.race([delay(action === "click" ? 250 : 50), dialogOpened]);
 				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
 				if (dialogInfo) {
-					this.holdDialogSession(page, session); keepSessionOpen = true;
+					this.holdDialogSession(page, session, dialogInfo); keepSessionOpen = true;
 					return { structuredContent: { action, x, y, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 				}
 				const metadataStartedAt = Date.now();
@@ -1368,7 +1475,7 @@ export class BrowserSession extends DurableObject<Env> {
 				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 				timings.metadataMs = Date.now() - metadataStartedAt;
 				if (outcome.kind === "dialog") {
-					this.holdDialogSession(page, session); keepSessionOpen = true;
+					this.holdDialogSession(page, session, outcome.dialog); keepSessionOpen = true;
 					return { structuredContent: { action, x, y, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 				}
 				if (outcome.kind === "error") throw outcome.error;
@@ -1410,7 +1517,7 @@ export class BrowserSession extends DurableObject<Env> {
 				await Promise.race([delay(150), dialogOpened]);
 				const timings: Json = { inputDispatchMs, settleMs: Date.now() - settleStartedAt };
 				if (dialogInfo) {
-					this.holdDialogSession(page, session); keepSessionOpen = true;
+					this.holdDialogSession(page, session, dialogInfo); keepSessionOpen = true;
 					return { structuredContent: { action, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 				}
 				const metadataStartedAt = Date.now();
@@ -1418,7 +1525,7 @@ export class BrowserSession extends DurableObject<Env> {
 				const outcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 				timings.metadataMs = Date.now() - metadataStartedAt;
 				if (outcome.kind === "dialog") {
-					this.holdDialogSession(page, session); keepSessionOpen = true;
+					this.holdDialogSession(page, session, outcome.dialog); keepSessionOpen = true;
 					return { structuredContent: { action, dialog: outcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 				}
 				if (outcome.kind === "error") throw outcome.error;
@@ -1503,7 +1610,7 @@ export class BrowserSession extends DurableObject<Env> {
 				const value = error as { dialogPending?: boolean; dialog?: DialogInfo };
 				if (!dialogInfo && !value.dialogPending) throw error;
 				dialogInfo ??= value.dialog;
-				this.holdDialogSession(page, session); keepSessionOpen = true;
+				this.holdDialogSession(page, session, dialogInfo); keepSessionOpen = true;
 				return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings: { targetResolutionMs, inputDispatchMs: Date.now() - dispatchStartedAt } } };
 			}
 			const inputDispatchMs = Date.now() - dispatchStartedAt;
@@ -1513,7 +1620,7 @@ export class BrowserSession extends DurableObject<Env> {
 			const settleMs = Date.now() - settleStartedAt;
 			const timings: Json = { targetResolutionMs, inputDispatchMs, settleMs };
 			if (dialogInfo) {
-				this.holdDialogSession(page, session); keepSessionOpen = true;
+				this.holdDialogSession(page, session, dialogInfo); keepSessionOpen = true;
 				return { structuredContent: { action, result, dialog: dialogInfo, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 			}
 			const metadataStartedAt = Date.now();
@@ -1522,7 +1629,7 @@ export class BrowserSession extends DurableObject<Env> {
 			const metadataOutcome = await Promise.race([metadata, dialogOpened.then((dialog) => ({ kind: "dialog" as const, dialog }))]);
 			timings.metadataMs = Date.now() - metadataStartedAt;
 			if (metadataOutcome.kind === "dialog") {
-				this.holdDialogSession(page, session); keepSessionOpen = true;
+				this.holdDialogSession(page, session, metadataOutcome.dialog); keepSessionOpen = true;
 				return { structuredContent: { action, result, dialog: metadataOutcome.dialog, dialogPending: true, page: { tabId: getTabId(page), url: page.url() }, timings } };
 			}
 			if (metadataOutcome.kind === "error") throw metadataOutcome.error;
@@ -1593,7 +1700,7 @@ export class BrowserSession extends DurableObject<Env> {
 			else if (action.type === "evaluate") {
 				const outcome = await evaluatePageWithDialog(page, String(action.expression), Number(action.timeoutMs ?? 10_000));
 				if (outcome.dialogPending) {
-					if (outcome.session) this.holdDialogSession(page, outcome.session);
+					if (outcome.session) this.holdDialogSession(page, outcome.session, outcome.dialog);
 					return { structuredContent: { dialogPending: true, dialog: outcome.dialog, page: { tabId: getTabId(page), url: page.url() }, requests, droppedRequests } };
 				}
 			}
@@ -1672,7 +1779,7 @@ export class BrowserSession extends DurableObject<Env> {
 				} else if (step.type === "evaluate") {
 					const evaluation = await evaluatePageWithDialog(page, String(step.expression), Math.min(Number(step.timeoutMs ?? 10_000), Math.max(deadline - Date.now(), 1)));
 					if (evaluation.dialogPending) {
-						if (evaluation.session) this.holdDialogSession(page, evaluation.session);
+						if (evaluation.session) this.holdDialogSession(page, evaluation.session, evaluation.dialog);
 						stepResult = { dialogPending: true, dialog: evaluation.dialog };
 						outcomes.push({ index, ok: true, result: boundedResult(stepResult), dialogPending: true, page: { tabId: getTabId(page), url: page.url() } });
 						dialogPending = true;
