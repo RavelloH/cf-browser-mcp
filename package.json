@@ -13,7 +13,7 @@
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",
     "@cloudflare/workers-oauth-provider": "^1.2.3",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.3.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
